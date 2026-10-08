@@ -1152,10 +1152,110 @@ static void waltgov_exit(struct cpufreq_policy *policy)
 	cpufreq_disable_fast_switch(policy);
 }
 
+/*
+ * Frequency steps that deliver far less performance than their label implies
+ * while still paying that step's voltage (measured with per-step CoreMark
+ * runs; the step is effectively clocked well below its nominal frequency).
+ * A neighbouring step is always the better choice, so the governor must not
+ * pick them.
+ *
+ * Lists are matched on cpuinfo.max_freq so they can never be applied to a
+ * different SoC or cluster by accident.
+ */
+static const unsigned int waltgov_bad_freqs_gold[] = {
+	940800, 1056000, 1190400,
+};
+
+static const unsigned int waltgov_bad_freqs_prime[] = {
+	960000, 1094400,
+};
+
+struct waltgov_bad_freq_list {
+	unsigned int cpuinfo_max_freq;
+	const unsigned int *freqs;
+	unsigned int nr_freqs;
+	bool announced;
+};
+
+static struct waltgov_bad_freq_list waltgov_bad_freq_lists[] = {
+	{
+		.cpuinfo_max_freq = 2803200,
+		.freqs = waltgov_bad_freqs_gold,
+		.nr_freqs = ARRAY_SIZE(waltgov_bad_freqs_gold),
+	},
+	{
+		.cpuinfo_max_freq = 3014400,
+		.freqs = waltgov_bad_freqs_prime,
+		.nr_freqs = ARRAY_SIZE(waltgov_bad_freqs_prime),
+	},
+};
+
+/*
+ * Flag the steps above as inefficient in the policy's frequency table, so
+ * that cpufreq_driver_resolve_freq() (CPUFREQ_RELATION_LE) resolves to the
+ * next efficient step instead. The table itself is not modified, so sysfs
+ * frequency lists, scaling_{min,max}_freq and hardware reads are unaffected,
+ * and the core still honours explicit policy limits.
+ *
+ * This runs from waltgov_start() rather than once at WALT init because the
+ * cpufreq driver can rebuild the table when a whole cluster goes offline and
+ * comes back, and the first CPU of a cluster may be offline at init time.
+ * Called with the policy locked and before the governor callbacks are armed.
+ */
+static void waltgov_skip_bad_freqs(struct cpufreq_policy *policy)
+{
+	struct waltgov_bad_freq_list *bl = NULL;
+	struct cpufreq_frequency_table *pos;
+	unsigned int i, nr_marked = 0;
+
+	if (!policy->freq_table)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(waltgov_bad_freq_lists); i++) {
+		if (waltgov_bad_freq_lists[i].cpuinfo_max_freq ==
+		    policy->cpuinfo.max_freq) {
+			bl = &waltgov_bad_freq_lists[i];
+			break;
+		}
+	}
+	if (!bl)
+		return;
+
+	/* Honour only the list above, not inefficiency hints from the EM. */
+	cpufreq_for_each_entry(pos, policy->freq_table)
+		pos->flags &= ~CPUFREQ_INEFFICIENT_FREQ;
+	policy->efficiencies_available = false;
+
+	for (i = 0; i < bl->nr_freqs; i++) {
+		unsigned int freq = bl->freqs[i];
+
+		/* Never flag either end of the table. */
+		if (freq <= policy->cpuinfo.min_freq ||
+		    freq >= policy->cpuinfo.max_freq)
+			continue;
+
+		/* -EINVAL: step absent or table unsorted, nothing to do. */
+		if (cpufreq_table_set_inefficient(policy, freq))
+			continue;
+
+		nr_marked++;
+		pr_debug("cpu%u: %u kHz marked inefficient\n",
+			 policy->cpu, freq);
+	}
+
+	if (nr_marked && !bl->announced) {
+		bl->announced = true;
+		pr_info("policy%u: skipping %u low-IPC frequency step(s)\n",
+			policy->cpu, nr_marked);
+	}
+}
+
 static int waltgov_start(struct cpufreq_policy *policy)
 {
 	struct waltgov_policy *wg_policy = policy->governor_data;
 	unsigned int cpu;
+
+	waltgov_skip_bad_freqs(policy);
 
 	wg_policy->up_rate_delay_ns =
 		wg_policy->tunables->up_rate_limit_us * NSEC_PER_USEC;
