@@ -32,7 +32,7 @@ jobs:
       - name: Checkout Patched Wi-Fi Driver Source
         uses: actions/checkout@v4
         with:
-          repository: Raju-yeager/Eviltwin-drivers_kernel_xiaomi_sm8635-modules
+          repository: Harshit-2077/drivers_kernel_xiaomi_sm8635-modules
           path: modules_src
           fetch-depth: 1
 
