@@ -1,0 +1,68 @@
+name: Build Radium Kernel & Monitor Wi-Fi
+
+on:
+  push:
+    branches: [ "17", "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Maximize Build Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex git libelf-dev \
+            libncurses-dev libssl-dev lld llvm pahole python3 rsync \
+            unzip zip zstd
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: radium-sm8635-ccache
+          max-size: 2G
+
+      - name: Setup Neutron Clang Toolchain
+        run: |
+          mkdir -p "$HOME/clang"
+          cd "$HOME/clang"
+          bash <(curl -s "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") -S
+          echo "CLANG_DIR=$HOME/clang" >> "$GITHUB_ENV"
+
+      - name: Run CI Build Script
+        run: |
+          chmod +x scripts/ci/build.sh
+          ./scripts/ci/build.sh
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Radium-SM8635-Packages-${{ github.sha }}
+          path: |
+            dist/*.zip
+            dist/Image-*
+          if-no-files-found: error
+
+      - name: Upload Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Radium-Build-Logs-Debug
+          path: |
+            out/*.log
+          if-no-files-found: ignore
+          
