@@ -11,10 +11,16 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
-      - name: Maximize Build Space
+      - name: Maximize Build Space & Add 8GB Swap (Prevents Exit 143 OOM)
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
           df -h
 
       - name: Checkout Repository
@@ -107,7 +113,7 @@ jobs:
             fi
           done
 
-          log "Applying Vibranium config + Wireless Monitor dependencies..."
+          log "Applying Vibranium config + ThinLTO + Wireless Monitor dependencies..."
           ./scripts/config --file "$OUT/.config" \
             --set-str LOCALVERSION "-Radium-Monitor" \
             -d LOCALVERSION_AUTO \
@@ -139,10 +145,10 @@ jobs:
             -d HZ_1000 \
             --set-val HZ 250 \
             -d LTO_NONE \
-            -d LTO_CLANG_THIN \
+            -d LTO_CLANG_FULL \
             -e LTO \
             -e LTO_CLANG \
-            -e LTO_CLANG_FULL \
+            -e LTO_CLANG_THIN \
             -e CFI_CLANG \
             -d MODULE_SIG_ALL \
             -e MODULE_SIG_SHA256 \
@@ -184,14 +190,14 @@ jobs:
           cp -f "$OUT/.config" "$DIST/config-$FLAVOR"
 
           # 4. Fetch Clean Stock WLAN Driver & Apply Loukious's Last 3 Commits
-          log "Fetching clean stock SM8635 modules from $STOCK_MODULES_REPO..."
+          log "Fetching clean stock SM8635 modules..."
           rm -rf "$ROOT/modules_src"
           mkdir -p "$ROOT/modules_src"
-          git clone --depth=1 "$STOCK_MODULES_REPO" "$ROOT/modules_src"
+          git clone --depth=1 "$STOCK_MODULES_REPO" "$ROOT/modules_src" || \
+            git clone --depth=1 -b lineage-23.2 "https://github.com/peridot-dev/android_kernel_xiaomi_sm8635-modules.git" "$ROOT/modules_src"
 
           WLAN_DIR="$ROOT/modules_src/qcom/opensource/wlan"
           QCACLD_DIR="$WLAN_DIR/qcacld-3.0"
-          PERIDOT_WLAN_DEFCONFIG="$QCACLD_DIR/configs/pineapple_gki_qca6750_defconfig"
 
           log "Fetching last $LOUKIOUS_COMMIT_COUNT commits from $LOUKIOUS_WLAN_REPO ($LOUKIOUS_WLAN_BRANCH)..."
           TMP_LOUK="$(mktemp -d)"
@@ -201,26 +207,31 @@ jobs:
           git -C "$TMP_LOUK/repo" format-patch -"$LOUKIOUS_COMMIT_COUNT" HEAD -o "$TMP_LOUK/patches"
 
           log "Porting and applying Loukious's 3 commits onto clean stock peridot WLAN driver..."
-          python3 - "$WLAN_DIR" "$QCACLD_DIR" "$PERIDOT_WLAN_DEFCONFIG" "$TMP_LOUK/patches" << 'PYEOF'
+          python3 - "$WLAN_DIR" "$QCACLD_DIR" "$TMP_LOUK/patches" << 'PYEOF'
           import glob
           import os
           import re
           import subprocess
           import sys
 
-          wlan_dir, qcacld_dir, peridot_defconfig, patches_dir = sys.argv[1:5]
+          wlan_dir, qcacld_dir, patches_dir = sys.argv[1:4]
           patch_files = sorted(glob.glob(os.path.join(patches_dir, "*.patch")))
 
-          def update_peridot_defconfig(cfg_key, cfg_val):
-              if not os.path.isfile(peridot_defconfig):
-                  return
-              lines = open(peridot_defconfig, "r", encoding="utf-8", errors="ignore").read().splitlines()
-              out = [l for l in lines if not re.match(rf'^#?\s*{re.escape(cfg_key)}(\b|=)', l)]
-              if cfg_val is not None:
-                  out.append(f"{cfg_key}={cfg_val}")
-              else:
-                  out.append(f"# {cfg_key} is not set")
-              open(peridot_defconfig, "w", encoding="utf-8").write("\n".join(out) + "\n")
+          # Update all potential qca6750/default defconfigs in qcacld-3.0/configs
+          target_defconfigs = glob.glob(os.path.join(qcacld_dir, "configs", "*qca6750*")) + \
+                              glob.glob(os.path.join(qcacld_dir, "configs", "default_defconfig"))
+
+          def update_wlan_defconfigs(cfg_key, cfg_val):
+              for dcfg in target_defconfigs:
+                  if not os.path.isfile(dcfg):
+                      continue
+                  lines = open(dcfg, "r", encoding="utf-8", errors="ignore").read().splitlines()
+                  out = [l for l in lines if not re.match(rf'^#?\s*{re.escape(cfg_key)}(\b|=)', l)]
+                  if cfg_val is not None:
+                      out.append(f"{cfg_key}={cfg_val}")
+                  else:
+                      out.append(f"# {cfg_key} is not set")
+                  open(dcfg, "w", encoding="utf-8").write("\n".join(out) + "\n")
 
           for pf in patch_files:
               print(f"\n=== Applying {os.path.basename(pf)} ===")
@@ -236,12 +247,12 @@ jobs:
                       m_unset = re.match(r'^\+#\s*(CONFIG_[A-Z0-9_]+)\s+is not set', line)
                       if m_add:
                           k, v = m_add.group(1), m_add.group(2).strip()
-                          print(f"  [defconfig port] Setting {k}={v} in pineapple_gki_qca6750_defconfig")
-                          update_peridot_defconfig(k, v)
+                          print(f"  [defconfig port] Setting {k}={v}")
+                          update_wlan_defconfigs(k, v)
                       elif m_del or m_unset:
                           k = (m_del or m_unset).group(1)
-                          print(f"  [defconfig port] Disabling {k} in pineapple_gki_qca6750_defconfig")
-                          update_peridot_defconfig(k, None)
+                          print(f"  [defconfig port] Disabling {k}")
+                          update_wlan_defconfigs(k, None)
 
               has_subrepo_prefix = bool(re.search(r'^diff --git a/(qcacld-3\.0|qca-wifi-host-cmn|fw-api)/', raw, re.MULTILINE))
               target_dir = wlan_dir if has_subrepo_prefix else qcacld_dir
@@ -395,7 +406,7 @@ jobs:
           version=v1.0
           versionCode=1
           author=Raju-yeager
-          description=Direct monitor mode and packet injection for POCO F6 (peridot) ported from Loukious onyx-v-oss-monitor-direct. Adapts to ANY kernel at boot.
+          description=Direct monitor mode for POCO F6 (peridot) ported from Loukious onyx-v-oss-monitor-direct. Adapts to ANY kernel at boot.
           EOF
 
             cat << 'EOF' > "$MAGISK_DIR/customize.sh"
@@ -442,7 +453,7 @@ jobs:
               [ -n "$2" ] && iw dev wlan0 set channel "$2"
               echo "[+] wlan0 is now in Monitor Mode"
           elif [ "$1" = "sta" ]; then
-              echo "[+] Restoring Normal Android Wi-Fi..."
+            echo "[+] Restoring Normal Android Wi-Fi..."
               ip link set wlan0 down
               umount "$STOCK_KO" 2>/dev/null
               rmmod qca_cld3_qca6750 2>/dev/null
@@ -471,10 +482,10 @@ jobs:
           if-no-files-found: error
 
       - name: Upload Logs on Failure
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Radium-Build-Logs-Debug
           path: |
             out/*.log
-          if-no-files-found: ignore 
+          if-no-files-found: ignore
