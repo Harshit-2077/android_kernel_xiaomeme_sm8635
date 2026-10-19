@@ -47,7 +47,6 @@ PATCH_URLS=(
   "https://raw.githubusercontent.com/Goldzxcbug/Droidspaces_Kernel_patch/main/NTsync/ntsync_compat_android14-6.1.patch"
   "https://raw.githubusercontent.com/Goldzxcbug/Droidspaces_Kernel_patch/main/GKI/6.1/GKI-6.1-sysvipc_kabi_6_7_8.patch"
   "https://raw.githubusercontent.com/Goldzxcbug/Droidspaces_Kernel_patch/main/cgroup_limits/fix_cgroup_limits_kabi_6.1.141.patch"
-  "https://raw.githubusercontent.com/Goldzxcbug/Droidspaces_Kernel_patch/main/CVE-UserNS/cve-2026-43499-rtmutex-6.1.patch"
 )
 
 PATCH_DIR="$OUT/pa"
