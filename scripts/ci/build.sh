@@ -27,7 +27,7 @@ JOBS="${JOBS:-$(nproc --all)}"
 ZIP_PREFIX="${ZIP_PREFIX:-Radium-Monitor}"
 ZIP_VERSION="${ZIP_VERSION:-v1.0}"
 
-# Suppress Clang 23 strict warnings from halting compilation
+# Suppress Clang 23/24 strict warnings from halting compilation
 WARN_FLAGS="-Wno-error -Wno-gnu-zero-variadic-macro-arguments -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-format ${KCFLAGS:-}"
 
 log() {
@@ -60,7 +60,7 @@ for frag in \
   fi
 done
 
-log "Applying Vibranium config + Wireless Monitor dependencies..."
+log "Applying Vibranium config + ThinLTO + Wireless Monitor dependencies..."
 ./scripts/config --file "$OUT/.config" \
   --set-str LOCALVERSION "-Radium-Monitor" \
   -d LOCALVERSION_AUTO \
@@ -92,10 +92,10 @@ log "Applying Vibranium config + Wireless Monitor dependencies..."
   -d HZ_1000 \
   --set-val HZ 250 \
   -d LTO_NONE \
-  -d LTO_CLANG_THIN \
+  -d LTO_CLANG_FULL \
   -e LTO \
   -e LTO_CLANG \
-  -e LTO_CLANG_FULL \
+  -e LTO_CLANG_THIN \
   -e CFI_CLANG \
   -d MODULE_SIG_ALL \
   -e MODULE_SIG_SHA256 \
@@ -140,11 +140,11 @@ cp -f "$OUT/.config" "$DIST/config-$FLAVOR"
 log "Fetching clean stock SM8635 modules from $STOCK_MODULES_REPO..."
 rm -rf "$ROOT/modules_src"
 mkdir -p "$ROOT/modules_src"
-git clone --depth=1 "$STOCK_MODULES_REPO" "$ROOT/modules_src"
+git clone --depth=1 "$STOCK_MODULES_REPO" "$ROOT/modules_src" || \
+  git clone --depth=1 -b lineage-23.2 "https://github.com/peridot-dev/android_kernel_xiaomi_sm8635-modules.git" "$ROOT/modules_src"
 
 WLAN_DIR="$ROOT/modules_src/qcom/opensource/wlan"
 QCACLD_DIR="$WLAN_DIR/qcacld-3.0"
-PERIDOT_WLAN_DEFCONFIG="$QCACLD_DIR/configs/pineapple_gki_qca6750_defconfig"
 
 log "Fetching last $LOUKIOUS_COMMIT_COUNT commits from $LOUKIOUS_WLAN_REPO ($LOUKIOUS_WLAN_BRANCH)..."
 TMP_LOUK="$(mktemp -d)"
@@ -154,32 +154,37 @@ git -C "$TMP_LOUK/repo" log -n "$LOUKIOUS_COMMIT_COUNT" --reverse --oneline
 git -C "$TMP_LOUK/repo" format-patch -"$LOUKIOUS_COMMIT_COUNT" HEAD -o "$TMP_LOUK/patches"
 
 log "Porting and applying Loukious's 3 commits onto clean stock peridot WLAN driver..."
-python3 - "$WLAN_DIR" "$QCACLD_DIR" "$PERIDOT_WLAN_DEFCONFIG" "$TMP_LOUK/patches" << 'PYEOF'
+python3 - "$WLAN_DIR" "$QCACLD_DIR" "$TMP_LOUK/patches" << 'PYEOF'
 import glob
 import os
 import re
 import subprocess
 import sys
 
-wlan_dir, qcacld_dir, peridot_defconfig, patches_dir = sys.argv[1:5]
+wlan_dir, qcacld_dir, patches_dir = sys.argv[1:4]
 patch_files = sorted(glob.glob(os.path.join(patches_dir, "*.patch")))
 
-def update_peridot_defconfig(cfg_key, cfg_val):
-    if not os.path.isfile(peridot_defconfig):
-        return
-    lines = open(peridot_defconfig, "r", encoding="utf-8", errors="ignore").read().splitlines()
-    out = [l for l in lines if not re.match(rf'^#?\s*{re.escape(cfg_key)}(\b|=)', l)]
-    if cfg_val is not None:
-        out.append(f"{cfg_key}={cfg_val}")
-    else:
-        out.append(f"# {cfg_key} is not set")
-    open(peridot_defconfig, "w", encoding="utf-8").write("\n".join(out) + "\n")
+# Update all potential qca6750/default defconfigs in qcacld-3.0/configs
+target_defconfigs = glob.glob(os.path.join(qcacld_dir, "configs", "*qca6750*")) + \
+                    glob.glob(os.path.join(qcacld_dir, "configs", "default_defconfig"))
+
+def update_wlan_defconfigs(cfg_key, cfg_val):
+    for dcfg in target_defconfigs:
+        if not os.path.isfile(dcfg):
+            continue
+        lines = open(dcfg, "r", encoding="utf-8", errors="ignore").read().splitlines()
+        out = [l for l in lines if not re.match(rf'^#?\s*{re.escape(cfg_key)}(\b|=)', l)]
+        if cfg_val is not None:
+            out.append(f"{cfg_key}={cfg_val}")
+        else:
+            out.append(f"# {cfg_key} is not set")
+        open(dcfg, "w", encoding="utf-8").write("\n".join(out) + "\n")
 
 for pf in patch_files:
     print(f"\n=== Applying {os.path.basename(pf)} ===")
     raw = open(pf, "r", encoding="utf-8", errors="ignore").read()
 
-    # Mirror any defconfig changes from onyx onto pineapple_gki_qca6750_defconfig
+    # Mirror any defconfig changes from onyx onto qca6750 defconfigs
     in_config_file = False
     for line in raw.splitlines():
         if line.startswith("diff --git "):
@@ -190,12 +195,12 @@ for pf in patch_files:
             m_unset = re.match(r'^\+#\s*(CONFIG_[A-Z0-9_]+)\s+is not set', line)
             if m_add:
                 k, v = m_add.group(1), m_add.group(2).strip()
-                print(f"  [defconfig port] Setting {k}={v} in pineapple_gki_qca6750_defconfig")
-                update_peridot_defconfig(k, v)
+                print(f"  [defconfig port] Setting {k}={v}")
+                update_wlan_defconfigs(k, v)
             elif m_del or m_unset:
                 k = (m_del or m_unset).group(1)
-                print(f"  [defconfig port] Disabling {k} in pineapple_gki_qca6750_defconfig")
-                update_peridot_defconfig(k, None)
+                print(f"  [defconfig port] Disabling {k}")
+                update_wlan_defconfigs(k, None)
 
     has_subrepo_prefix = bool(re.search(r'^diff --git a/(qcacld-3\.0|qca-wifi-host-cmn|fw-api)/', raw, re.MULTILINE))
     target_dir = wlan_dir if has_subrepo_prefix else qcacld_dir
@@ -296,6 +301,7 @@ if ! make -j"$JOBS" -C "$ROOT" O="$OUT" \
   CONFIG_QCA_WIFI_ISOC=0 \
   CONFIG_QCA_WIFI_2_0=1 \
   WLAN_PROFILE=qca6750 \
+  CONFIG_QCA_CLD_WLAN_PROFILE=qca6750 \
   DYNAMIC_SINGLE_CHIP=qca6750 \
   DEVNAME=qca6750 \
   MODNAME=qca_cld3_qca6750 \
@@ -355,7 +361,7 @@ name=Universal QCA6750 Monitor Mode Wi-Fi
 version=v1.0
 versionCode=1
 author=Raju-yeager
-description=Direct monitor mode and packet injection for POCO F6 (peridot) ported from Loukious onyx-v-oss-monitor-direct. Adapts to ANY kernel at boot.
+description=Direct monitor mode for POCO F6 (peridot) ported from Loukious onyx-v-oss-monitor-direct. Adapts to ANY kernel at boot.
 EOF
 
   cat << 'EOF' > "$MAGISK_DIR/customize.sh"
