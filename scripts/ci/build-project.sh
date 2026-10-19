@@ -71,12 +71,12 @@ for PATCH_URL in "${PATCH_URLS[@]}"; do
   fi
 
   log "Checking patch $PATCH_INDEX..."
-  if ! git apply --check "$PATCH_FILE"; then
+  if ! patch --dry-run -p1 -d "$ROOT" < "$PATCH_FILE"; then
     echo "::error::Patch $PATCH_INDEX cannot be applied: $PATCH_URL"
     exit 1
   fi
 
-  git apply "$PATCH_FILE"
+  patch -p1 -d "$ROOT" < "$PATCH_FILE"
   log "Applied patch $PATCH_INDEX successfully."
 done
 
