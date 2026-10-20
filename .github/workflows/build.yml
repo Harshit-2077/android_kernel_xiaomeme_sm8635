@@ -84,7 +84,7 @@ jobs:
           WARN_FLAGS="-Wno-error -Wno-gnu-zero-variadic-macro-arguments -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-format"
 
           log() {
-            printf '\033[1;34m[%s]\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*"
+            printf '\033[1;34m[%s]\033[0m %s\n' "$(date -u +\%H:\%M:\%S)" "$*"
           }
 
           log "Toolchain: $(clang --version | head -n 1)"
@@ -199,6 +199,11 @@ jobs:
           WLAN_DIR="$ROOT/modules_src/qcom/opensource/wlan"
           QCACLD_DIR="$WLAN_DIR/qcacld-3.0"
 
+          # Ensure pineapple_gki_qca6750_defconfig is used even if Kbuild looks up qca6750_defconfig
+          if [[ -f "$QCACLD_DIR/configs/pineapple_gki_qca6750_defconfig" ]]; then
+            cp -f "$QCACLD_DIR/configs/pineapple_gki_qca6750_defconfig" "$QCACLD_DIR/configs/qca6750_defconfig"
+          fi
+
           log "Fetching last $LOUKIOUS_COMMIT_COUNT commits from $LOUKIOUS_WLAN_REPO ($LOUKIOUS_WLAN_BRANCH)..."
           TMP_LOUK="$(mktemp -d)"
           git clone --depth=10 --branch "$LOUKIOUS_WLAN_BRANCH" "$LOUKIOUS_WLAN_REPO" "$TMP_LOUK/repo"
@@ -221,7 +226,7 @@ jobs:
                               glob.glob(os.path.join(qcacld_dir, "configs", "default_defconfig"))
 
           def update_wlan_defconfigs(cfg_key, cfg_val):
-              for dcfg in target_defconfigs:
+              for dcfg in set(target_defconfigs):
                   if not os.path.isfile(dcfg):
                       continue
                   lines = open(dcfg, "r", encoding="utf-8", errors="ignore").read().splitlines()
@@ -236,38 +241,89 @@ jobs:
               print(f"\n=== Applying {os.path.basename(pf)} ===")
               raw = open(pf, "r", encoding="utf-8", errors="ignore").read()
 
-              in_config_file = False
-              for line in raw.splitlines():
-                  if line.startswith("diff --git "):
-                      in_config_file = ("/configs/" in line or "defconfig" in line)
-                  elif in_config_file:
-                      m_add = re.match(r'^\+(CONFIG_[A-Z0-9_]+)=(.+)$', line)
-                      m_del = re.match(r'^-(CONFIG_[A-Z0-9_]+)=', line)
-                      m_unset = re.match(r'^\+#\s*(CONFIG_[A-Z0-9_]+)\s+is not set', line)
-                      if m_add:
-                          k, v = m_add.group(1), m_add.group(2).strip()
-                          print(f"  [defconfig port] Setting {k}={v}")
-                          update_wlan_defconfigs(k, v)
-                      elif m_del or m_unset:
-                          k = (m_del or m_unset).group(1)
-                          print(f"  [defconfig port] Disabling {k}")
-                          update_wlan_defconfigs(k, None)
+              # Split patch by file diff so we can handle defconfigs vs Kbuild vs C/H files cleanly
+              file_diffs = re.split(r'(?=^diff --git )', raw, flags=re.MULTILINE)
+              for fdiff in file_diffs:
+                  if not fdiff.startswith("diff --git "):
+                      continue
+                  header_line = fdiff.splitlines()[0]
 
-              has_subrepo_prefix = bool(re.search(r'^diff --git a/(qcacld-3\.0|qca-wifi-host-cmn|fw-api)/', raw, re.MULTILINE))
-              target_dir = wlan_dir if has_subrepo_prefix else qcacld_dir
-              print(f"  [target] Applying to {target_dir}")
+                  # 1. Mirror any defconfig changes via update_wlan_defconfigs
+                  if "/configs/" in header_line or "defconfig" in header_line:
+                      for line in fdiff.splitlines():
+                          m_add = re.match(r'^\+(CONFIG_[A-Z0-9_]+)=(.+)$', line)
+                          m_del = re.match(r'^-(CONFIG_[A-Z0-9_]+)=', line)
+                          m_unset = re.match(r'^\+#\s*(CONFIG_[A-Z0-9_]+)\s+is not set', line)
+                          if m_add:
+                              k, v = m_add.group(1), m_add.group(2).strip()
+                              print(f"  [defconfig port] Setting {k}={v}")
+                              update_wlan_defconfigs(k, v)
+                          elif m_del or m_unset:
+                              k = (m_del or m_unset).group(1)
+                              print(f"  [defconfig port] Disabling {k}")
+                              update_wlan_defconfigs(k, None)
+                      continue
 
-              cmd = ["patch", "-d", target_dir, "-p1", "--forward", "--batch", "--ignore-whitespace", "--fuzz=3"]
-              proc = subprocess.run(cmd, input=raw, text=True, capture_output=True)
-              print(proc.stdout)
-              if proc.returncode != 0:
-                  for root, _, files in os.walk(target_dir):
-                      for f in files:
-                          if f.endswith(".rej"):
-                              rej_path = os.path.join(root, f)
-                              if "/configs/" not in rej_path:
+                  # 2. Apply C/H/Kbuild file diff without fuzzy whitespace corruption
+                  has_subrepo_prefix = bool(re.search(r'^diff --git a/(qcacld-3\.0|qca-wifi-host-cmn|fw-api)/', fdiff, re.MULTILINE))
+                  target_dir = wlan_dir if has_subrepo_prefix else qcacld_dir
+
+                  # Try strict patch first (no --ignore-whitespace on Makefiles/Kbuild)
+                  is_makefile = ("Kbuild" in header_line or "Makefile" in header_line)
+                  if is_makefile:
+                      # For Kbuild/Makefile, replace leading tabs with spaces in added object/flag lines to prevent Make syntax errors
+                      sanitized_lines = []
+                      for l in fdiff.splitlines():
+                          if l.startswith("+\t") and not re.match(r'^\+\t(\$\(|@|echo|cp|rm|mkdir)', l):
+                              l = "+    " + l[2:]
+                          sanitized_lines.append(l)
+                      fdiff = "\n".join(sanitized_lines) + "\n"
+
+                  cmd = ["patch", "-d", target_dir, "-p1", "--forward", "--batch", "--fuzz=2"]
+                  if not is_makefile:
+                      cmd.append("--ignore-whitespace")
+                  proc = subprocess.run(cmd, input=fdiff, text=True, capture_output=True)
+                  if proc.returncode != 0:
+                      print(f"  [patch notice] {header_line}: {proc.stdout.strip()}")
+                      for root, _, files in os.walk(target_dir):
+                          for f in files:
+                              if f.endswith(".rej"):
+                                  rej_path = os.path.join(root, f)
                                   print(f"  [WARNING] Rejected hunk in {rej_path}:\n" + open(rej_path).read())
-                              os.remove(rej_path)
+                                  os.remove(rej_path)
+
+          # 3. Sanitize qcacld-3.0/Kbuild and configs/*defconfig to guarantee no 'recipe commences before first target'
+          kbuild_path = os.path.join(qcacld_dir, "Kbuild")
+          if os.path.isfile(kbuild_path):
+              kb_lines = open(kbuild_path, "r", encoding="utf-8", errors="ignore").read().splitlines()
+              fixed_kb = []
+              in_target_rule = False
+              for idx, line in enumerate(kb_lines):
+                  # Check if line is a Make target rule (e.g. `all:` or `clean:`), excluding `:=` or `+=`
+                  if re.match(r'^[A-Za-z0-9_.\-$/()+]+\s*:(?!=)', line):
+                      in_target_rule = True
+                  elif line.strip() == "" or re.match(r'^(ifeq|ifneq|ifdef|ifndef|else|endif)\b', line.strip()):
+                      in_target_rule = False
+
+                  # If a line starts with a TAB outside a target recipe, convert leading TABs to spaces
+                  if line.startswith("\t") and not in_target_rule:
+                      line = "    " + line.lstrip("\t")
+                  # Also fix stray spaces after trailing backslash continuation
+                  line = re.sub(r'\\\s+$', r'\\', line)
+                  fixed_kb.append(line)
+
+              # Ensure every line in a multi-line object list before a target or indented block has a trailing backslash if needed
+              for i in range(len(fixed_kb) - 1):
+                  cur = fixed_kb[i].rstrip()
+                  nxt = fixed_kb[i + 1]
+                  if (":=" in cur or "+=" in cur or cur.endswith(".o")) and not cur.endswith("\\") and not cur.strip().startswith("#"):
+                      if nxt.startswith("    ") and nxt.strip().endswith((".o", ".o \\")):
+                          fixed_kb[i] = cur + " \\"
+
+              open(kbuild_path, "w", encoding="utf-8").write("\n".join(fixed_kb) + "\n")
+              print("[+] Verified and sanitized qcacld-3.0/Kbuild around line 145:")
+              for lno in range(max(0, 130), min(len(fixed_kb), 160)):
+                  print(f"  {lno+1}: {fixed_kb[lno]}")
           PYEOF
           rm -rf "$TMP_LOUK"
 
@@ -361,7 +417,7 @@ jobs:
             KCFLAGS="$WARN_FLAGS" \
             modules 2>&1 | tee "$OUT/wlan_build.log"; then
             echo "::error::WLAN module build failed! Printing errors from wlan_build.log:"
-            grep -n -C 5 -E "(error:|fatal error:|undefined symbol|ld\.lld: error:)" "$OUT/wlan_build.log" || true
+            grep -n -C 5 -E "(error:|fatal error:|undefined symbol|ld\.lld: error:|Stop\.)" "$OUT/wlan_build.log" || true
             exit 1
           fi
 
