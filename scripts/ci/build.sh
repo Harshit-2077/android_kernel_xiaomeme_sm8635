@@ -5,11 +5,7 @@ FLAVOR="${1:-radium-monitor}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-# Clean Upstream Module & Patch Repositories
-STOCK_MODULES_REPO="https://github.com/LineageOS/android_kernel_xiaomi_sm8635-modules.git"
-LOUKIOUS_WLAN_REPO="https://github.com/Loukious/vendor_qcom_opensource_wlan.git"
-LOUKIOUS_WLAN_BRANCH="onyx-v-oss-monitor-direct"
-LOUKIOUS_COMMIT_COUNT=3
+PATCHED_MODULES_REPO="https://github.com/Raju-yeager/android_kernel_xiaomi_sm8635-modules.git"
 ANYKERNEL_REPO="https://github.com/osm0sis/AnyKernel3.git"
 
 CLANG_DIR="${CLANG_DIR:?CLANG_DIR must point to Clang root}"
@@ -27,7 +23,6 @@ JOBS="${JOBS:-$(nproc --all)}"
 ZIP_PREFIX="${ZIP_PREFIX:-Radium-Monitor}"
 ZIP_VERSION="${ZIP_VERSION:-v1.0}"
 
-# Suppress Clang 23/24 strict warnings from halting compilation
 WARN_FLAGS="-Wno-error -Wno-gnu-zero-variadic-macro-arguments -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-format ${KCFLAGS:-}"
 
 log() {
@@ -35,7 +30,7 @@ log() {
 }
 
 log "flavor=$FLAVOR  clang:$(clang --version | head -1)"
-log "Building directly from forked kernel source: $(head -n 4 "$ROOT/Makefile" | tr '\n' ' ')"
+log "Building directly from kernel source: $(head -n 4 "$ROOT/Makefile" | tr '\n' ' ')"
 
 # 1. Fix OpenSSL 3.0 undeclared 'key_pass' on Ubuntu 24.04 runners
 if [[ -f "$ROOT/certs/extract-cert.c" ]]; then
@@ -43,10 +38,10 @@ if [[ -f "$ROOT/certs/extract-cert.c" ]]; then
   sed -i '1i __attribute__((unused)) static const char *key_pass;' "$ROOT/certs/extract-cert.c"
 fi
 
-rm -rf "$OUT"
+rm -rf "$OUT" "$DIST"
 mkdir -p "$OUT" "$DIST"
 
-# 2. Generate Vibranium / Radium Defconfig
+# 2. Generate Base Defconfig
 log "Generating base gki_defconfig..."
 make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
 
@@ -136,91 +131,13 @@ cp -f "$IMG" "$DIST/Image-$FLAVOR"
 cp -f "$OUT/Module.symvers" "$DIST/Module.symvers-$FLAVOR"
 cp -f "$OUT/.config" "$DIST/config-$FLAVOR"
 
-# 4. Fetch Clean Stock WLAN Driver & Apply Loukious's Last 3 Commits
-log "Fetching clean stock SM8635 modules from $STOCK_MODULES_REPO..."
+# 4. Clone Pre-Patched WLAN Driver Repo & Build qca_cld3_qca6750.ko
+log "Cloning pre-patched SM8635 modules from $PATCHED_MODULES_REPO..."
 rm -rf "$ROOT/modules_src"
-mkdir -p "$ROOT/modules_src"
-git clone --depth=1 "$STOCK_MODULES_REPO" "$ROOT/modules_src" || \
-  git clone --depth=1 -b lineage-23.2 "https://github.com/peridot-dev/android_kernel_xiaomi_sm8635-modules.git" "$ROOT/modules_src"
+git clone --depth=1 "$PATCHED_MODULES_REPO" "$ROOT/modules_src"
 
 WLAN_DIR="$ROOT/modules_src/qcom/opensource/wlan"
 QCACLD_DIR="$WLAN_DIR/qcacld-3.0"
-
-log "Fetching last $LOUKIOUS_COMMIT_COUNT commits from $LOUKIOUS_WLAN_REPO ($LOUKIOUS_WLAN_BRANCH)..."
-TMP_LOUK="$(mktemp -d)"
-git clone --depth=10 --branch "$LOUKIOUS_WLAN_BRANCH" "$LOUKIOUS_WLAN_REPO" "$TMP_LOUK/repo"
-mkdir -p "$TMP_LOUK/patches"
-git -C "$TMP_LOUK/repo" log -n "$LOUKIOUS_COMMIT_COUNT" --reverse --oneline
-git -C "$TMP_LOUK/repo" format-patch -"$LOUKIOUS_COMMIT_COUNT" HEAD -o "$TMP_LOUK/patches"
-
-log "Porting and applying Loukious's 3 commits onto clean stock peridot WLAN driver..."
-python3 - "$WLAN_DIR" "$QCACLD_DIR" "$TMP_LOUK/patches" << 'PYEOF'
-import glob
-import os
-import re
-import subprocess
-import sys
-
-wlan_dir, qcacld_dir, patches_dir = sys.argv[1:4]
-patch_files = sorted(glob.glob(os.path.join(patches_dir, "*.patch")))
-
-# Update all potential qca6750/default defconfigs in qcacld-3.0/configs
-target_defconfigs = glob.glob(os.path.join(qcacld_dir, "configs", "*qca6750*")) + \
-                    glob.glob(os.path.join(qcacld_dir, "configs", "default_defconfig"))
-
-def update_wlan_defconfigs(cfg_key, cfg_val):
-    for dcfg in target_defconfigs:
-        if not os.path.isfile(dcfg):
-            continue
-        lines = open(dcfg, "r", encoding="utf-8", errors="ignore").read().splitlines()
-        out = [l for l in lines if not re.match(rf'^#?\s*{re.escape(cfg_key)}(\b|=)', l)]
-        if cfg_val is not None:
-            out.append(f"{cfg_key}={cfg_val}")
-        else:
-            out.append(f"# {cfg_key} is not set")
-        open(dcfg, "w", encoding="utf-8").write("\n".join(out) + "\n")
-
-for pf in patch_files:
-    print(f"\n=== Applying {os.path.basename(pf)} ===")
-    raw = open(pf, "r", encoding="utf-8", errors="ignore").read()
-
-    # Mirror any defconfig changes from onyx onto qca6750 defconfigs
-    in_config_file = False
-    for line in raw.splitlines():
-        if line.startswith("diff --git "):
-            in_config_file = ("/configs/" in line or "defconfig" in line)
-        elif in_config_file:
-            m_add = re.match(r'^\+(CONFIG_[A-Z0-9_]+)=(.+)$', line)
-            m_del = re.match(r'^-(CONFIG_[A-Z0-9_]+)=', line)
-            m_unset = re.match(r'^\+#\s*(CONFIG_[A-Z0-9_]+)\s+is not set', line)
-            if m_add:
-                k, v = m_add.group(1), m_add.group(2).strip()
-                print(f"  [defconfig port] Setting {k}={v}")
-                update_wlan_defconfigs(k, v)
-            elif m_del or m_unset:
-                k = (m_del or m_unset).group(1)
-                print(f"  [defconfig port] Disabling {k}")
-                update_wlan_defconfigs(k, None)
-
-    has_subrepo_prefix = bool(re.search(r'^diff --git a/(qcacld-3\.0|qca-wifi-host-cmn|fw-api)/', raw, re.MULTILINE))
-    target_dir = wlan_dir if has_subrepo_prefix else qcacld_dir
-    print(f"  [target] Applying to {target_dir}")
-
-    cmd = ["patch", "-d", target_dir, "-p1", "--forward", "--batch", "--ignore-whitespace", "--fuzz=3"]
-    proc = subprocess.run(cmd, input=raw, text=True, capture_output=True)
-    print(proc.stdout)
-    if proc.returncode != 0:
-        for root, _, files in os.walk(target_dir):
-            for f in files:
-                if f.endswith(".rej"):
-                    rej_path = os.path.join(root, f)
-                    if "/configs/" not in rej_path:
-                        print(f"  [WARNING] Rejected hunk in {rej_path}:\n" + open(rej_path).read())
-                    os.remove(rej_path)
-PYEOF
-rm -rf "$TMP_LOUK"
-
-log "Building Patched Wi-Fi Module (qca_cld3_qca6750.ko)"
 ln -sfn ../qca-wifi-host-cmn "$QCACLD_DIR/cmn"
 
 # Append 43 vendor_dlkm symbol CRCs so out-of-tree modpost succeeds
@@ -310,39 +227,32 @@ if ! make -j"$JOBS" -C "$ROOT" O="$OUT" \
   KCFLAGS="$WARN_FLAGS" \
   modules 2>&1 | tee "$OUT/wlan_build.log"; then
   echo "::error::WLAN module build failed! Printing errors from wlan_build.log:"
-  grep -n -C 5 -E "(error:|fatal error:|undefined symbol|ld\.lld: error:)" "$OUT/wlan_build.log" || true
+  grep -n -C 5 -E "(error:|fatal error:|undefined symbol|ld\.lld: error:|Stop\.)" "$OUT/wlan_build.log" || true
   exit 1
 fi
 
 llvm-strip --strip-debug "$QCACLD_DIR/qca_cld3_qca6750.ko"
 
-# 5. Package Unified AnyKernel3 Zip (Auto-clones AnyKernel3 if not in repo)
-if [[ "${SKIP_ZIP:-0}" != "1" ]]; then
-  STAGE="$(mktemp -d)"
-  if [[ -d "$ROOT/anykernel" ]]; then
-    cp -r "$ROOT/anykernel/." "$STAGE/"
-  else
-    log "No local anykernel/ dir found; cloning AnyKernel3 template..."
-    git clone --depth=1 "$ANYKERNEL_REPO" "$STAGE"
-    rm -rf "$STAGE/.git"
-    sed -i 's/device.name1=.*/device.name1=peridot/g' "$STAGE/anykernel.sh"
-    sed -i 's/device.name2=.*/device.name2=pineapple/g' "$STAGE/anykernel.sh"
-    sed -i 's/BLOCK=.*/BLOCK=auto;/g' "$STAGE/anykernel.sh"
-    sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=1;/g' "$STAGE/anykernel.sh"
-  fi
+# 5. Package Unified AnyKernel3 Zip
+STAGE="$(mktemp -d)"
+git clone --depth=1 "$ANYKERNEL_REPO" "$STAGE"
+rm -rf "$STAGE/.git"
+sed -i 's/device.name1=.*/device.name1=peridot/g' "$STAGE/anykernel.sh"
+sed -i 's/device.name2=.*/device.name2=pineapple/g' "$STAGE/anykernel.sh"
+sed -i 's/BLOCK=.*/BLOCK=auto;/g' "$STAGE/anykernel.sh"
+sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=1;/g' "$STAGE/anykernel.sh"
 
-  cp -f "$IMG" "$STAGE/Image"
-  if [[ -f "$QCACLD_DIR/qca_cld3_qca6750.ko" ]]; then
-    cp -f "$QCACLD_DIR/qca_cld3_qca6750.ko" "$STAGE/qca_cld3_qca6750.ko"
-  fi
-
-  STAMP="$(date -u +%Y%m%d)"
-  SHA="$(git rev-parse --short=7 HEAD 2>/dev/null || echo local)"
-  ZIP_NAME="${ZIP_PREFIX}-${FLAVOR}-${ZIP_VERSION}-${STAMP}-${SHA}.zip"
-  (cd "$STAGE" && zip -r9q "$DIST/$ZIP_NAME" .)
-  rm -rf "$STAGE"
-  log "Packaged unified flashable zip: $DIST/$ZIP_NAME"
+cp -f "$IMG" "$STAGE/Image"
+if [[ -f "$QCACLD_DIR/qca_cld3_qca6750.ko" ]]; then
+  cp -f "$QCACLD_DIR/qca_cld3_qca6750.ko" "$STAGE/qca_cld3_qca6750.ko"
 fi
+
+STAMP="$(date -u +%Y%m%d)"
+SHA="$(git rev-parse --short=7 HEAD 2>/dev/null || echo local)"
+ZIP_NAME="${ZIP_PREFIX}-${FLAVOR}-${ZIP_VERSION}-${STAMP}-${SHA}.zip"
+(cd "$STAGE" && zip -r9q "$DIST/$ZIP_NAME" .)
+rm -rf "$STAGE"
+log "Packaged unified flashable zip: $DIST/$ZIP_NAME"
 
 # 6. Build Universal Magisk/KernelSU Module
 if [[ -f "$QCACLD_DIR/qca_cld3_qca6750.ko" ]]; then
