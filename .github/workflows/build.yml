@@ -52,7 +52,7 @@ jobs:
           ./antman --patch=glibc
           echo "CLANG_DIR=$HOME/clang" >> "$GITHUB_ENV"
 
-      - name: Unified Build (Kernel + Patched WLAN Module + Flashable ZIPs)
+      - name: Unified Build (Kernel + WLAN Module + Flashable ZIPs)
         shell: bash
         run: |
           set -euo pipefail
@@ -61,9 +61,8 @@ jobs:
           ROOT="$GITHUB_WORKSPACE"
           cd "$ROOT"
 
-          # Target your repository with Loukious's commit on lineage-23.2
-          PATCHED_MODULES_REPO="https://github.com/Raju-yeager/android_kernel_xiaomi_sm8635-modules.git"
-          PATCHED_MODULES_BRANCH="lineage-23.2"
+          # Target redzrush101's SM8635 modules repository
+          PATCHED_MODULES_REPO="https://github.com/redzrush101/android_kernel_xiaomi_sm8635-modules.git"
           ANYKERNEL_REPO="https://github.com/osm0sis/AnyKernel3.git"
 
           export PATH="$CLANG_DIR/bin:$PATH"
@@ -188,53 +187,22 @@ jobs:
           cp -f "$OUT/Module.symvers" "$DIST/Module.symvers-$FLAVOR"
           cp -f "$OUT/.config" "$DIST/config-$FLAVOR"
 
-          # 4. Clone Raju-yeager/android_kernel_xiaomi_sm8635-modules & Build qca_cld3_qca6750.ko
-          log "Cloning patched SM8635 modules from $PATCHED_MODULES_REPO ($PATCHED_MODULES_BRANCH)..."
+          # 4. Clone redzrush101/android_kernel_xiaomi_sm8635-modules & Build qca_cld3_qca6750.ko
+          log "Cloning SM8635 modules from $PATCHED_MODULES_REPO..."
           rm -rf "$ROOT/modules_src"
-          git clone --depth=1 -b "$PATCHED_MODULES_BRANCH" "$PATCHED_MODULES_REPO" "$ROOT/modules_src"
+          git clone --depth=1 "$PATCHED_MODULES_REPO" "$ROOT/modules_src"
 
           WLAN_DIR="$ROOT/modules_src/qcom/opensource/wlan"
           QCACLD_DIR="$WLAN_DIR/qcacld-3.0"
           ln -sfn ../qca-wifi-host-cmn "$QCACLD_DIR/cmn"
 
-          # Auto-clean any unresolved git conflict markers (<<<<<<< HEAD ... ======= ... >>>>>>>)
-          # left in wlan_hdd_cfg80211.c or wlan_hdd_main.h by keeping the incoming patch side
-          python3 - "$WLAN_DIR" "$QCACLD_DIR" << 'PYEOF'
-          import glob
-          import os
-          import re
-          import sys
-
-          wlan_dir, qcacld_dir = sys.argv[1:3]
-
-          # 1. Resolve any leftover conflict markers in C/H files by keeping incoming patch side
-          conflict_re = re.compile(
-              r'^<<<<<<<[^\n]*\n(.*?)^=======\n(.*?)^>>>>>>>[^\n]*\n',
-              re.DOTALL | re.MULTILINE
-          )
-          for root, _, files in os.walk(wlan_dir):
-              for f in files:
-                  if f.endswith((".c", ".h", "Kbuild", "Makefile")) or "defconfig" in f:
-                      p = os.path.join(root, f)
-                      txt = open(p, "r", encoding="utf-8", errors="ignore").read()
-                      if "<<<<<<<" in txt:
-                          print(f"[+] Auto-resolving leftover conflict markers in: {p}")
-                          # Keep incoming changes (group 2)
-                          cleaned = conflict_re.sub(r'\2', txt)
-                          open(p, "w", encoding="utf-8").write(cleaned)
-
-          # 2. Ensure qca6750_defconfig & pineapple_gki_qca6750_defconfig enable monitor mode structs
-          for dcfg in glob.glob(os.path.join(qcacld_dir, "configs", "*qca6750*")) + \
-                      glob.glob(os.path.join(qcacld_dir, "configs", "default_defconfig")):
-              if os.path.isfile(dcfg):
-                  txt = open(dcfg, "r", encoding="utf-8", errors="ignore").read()
-                  if "CONFIG_FEATURE_MONITOR_MODE_SUPPORT" not in txt:
-                      txt += "\nCONFIG_FEATURE_MONITOR_MODE_SUPPORT := y\n"
-                  else:
-                      txt = re.sub(r'^#?\s*CONFIG_FEATURE_MONITOR_MODE_SUPPORT.*$', 'CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y', txt, flags=re.MULTILINE)
-                  open(dcfg, "w", encoding="utf-8").write(txt)
-                  print(f"[+] Enabled CONFIG_FEATURE_MONITOR_MODE_SUPPORT in {os.path.basename(dcfg)}")
-          PYEOF
+          # Ensure qca6750_defconfig & default_defconfig enable monitor mode support
+          for dcfg in "$QCACLD_DIR/configs/"*qca6750* "$QCACLD_DIR/configs/default_defconfig"; do
+            if [[ -f "$dcfg" ]]; then
+              sed -i '/CONFIG_FEATURE_MONITOR_MODE_SUPPORT/d' "$dcfg"
+              echo "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y" >> "$dcfg"
+            fi
+          done
 
           # Append 43 vendor_dlkm symbol CRCs so out-of-tree modpost succeeds
           python3 - "$OUT/Module.symvers" << 'PYEOF'
@@ -368,7 +336,7 @@ jobs:
           version=v1.0
           versionCode=1
           author=Raju-yeager
-          description=Monitor mode for POCO F6 (peridot) ported from Loukious onyx-v-oss-monitor-direct. Adapts to ANY kernel at boot.
+          description=Custom QCA6750 Wi-Fi module for POCO F6 (peridot). Adapts vermagic to active kernel at boot.
           EOF
 
             cat << 'EOF' > "$MAGISK_DIR/customize.sh"
