@@ -61,7 +61,6 @@ jobs:
           ROOT="$GITHUB_WORKSPACE"
           cd "$ROOT"
 
-          # Target redzrush101's SM8635 modules repository
           PATCHED_MODULES_REPO="https://github.com/Harshit-2077/android_kernel_xiaomi_sm8635-modules.git"
           ANYKERNEL_REPO="https://github.com/osm0sis/AnyKernel3.git"
 
@@ -187,10 +186,10 @@ jobs:
           cp -f "$OUT/Module.symvers" "$DIST/Module.symvers-$FLAVOR"
           cp -f "$OUT/.config" "$DIST/config-$FLAVOR"
 
-          # 4. Clone redzrush101/android_kernel_xiaomi_sm8635-modules & Build qca_cld3_qca6750.ko
-          log "Cloning SM8635 modules from $PATCHED_MODULES_REPO..."
+          # 4. Clone modules repo (pinned to the branch carrying our monitor-mode fix)
+          log "Cloning SM8635 modules from $PATCHED_MODULES_REPO (branch lineage-23.2)..."
           rm -rf "$ROOT/modules_src"
-          git clone --depth=1 "$PATCHED_MODULES_REPO" "$ROOT/modules_src"
+          git clone --depth=1 --branch lineage-23.2 "$PATCHED_MODULES_REPO" "$ROOT/modules_src"
 
           WLAN_DIR="$ROOT/modules_src/qcom/opensource/wlan"
           QCACLD_DIR="$WLAN_DIR/qcacld-3.0"
@@ -312,6 +311,44 @@ jobs:
             cp -f "$QCACLD_DIR/qca_cld3_qca6750.ko" "$STAGE/qca_cld3_qca6750.ko"
           fi
 
+          # --- CAVEAT-1 FIX: install the .ko via anykernel.sh (best-effort) ---
+          # AnyKernel3 only writes the boot image; without this block the .ko
+          # sits unused in the zip root. We try /vendor_dlkm first (Android 12+
+          # dynamic partition), then /vendor (older layouts). If neither is
+          # writable (e.g. Lineage recovery without mounted logical partitions),
+          # we drop the .ko on /sdcard so the Magisk module remains the fallback.
+          cat << 'AKEOF' >> "$STAGE/anykernel.sh"
+
+          ## Radium: install monitor-mode wlan module (best effort)
+          if [ -f "$AKHOME/qca_cld3_qca6750.ko" ]; then
+              radium_installed=0
+              for radium_tgt in /vendor_dlkm/lib/modules/qca_cld3_qca6750.ko /vendor/lib/modules/qca_cld3_qca6750.ko; do
+                  radium_tdir=$(dirname "$radium_tgt")
+                  radium_tdev=$(echo "$radium_tgt" | cut -d/ -f1-2)
+                  if [ -d "$radium_tdir" ]; then
+                      mount -o rw,remount "$radium_tdev" 2>/dev/null || true
+                      if cp -f "$AKHOME/qca_cld3_qca6750.ko" "$radium_tgt" 2>/dev/null; then
+                          chmod 644 "$radium_tgt"
+                          chown 0:0 "$radium_tgt" 2>/dev/null || true
+                          restorecon "$radium_tgt" 2>/dev/null || true
+                          echo "  - Radium: installed qca_cld3_qca6750.ko to $radium_tdir"
+                          radium_installed=1
+                          break
+                      fi
+                  fi
+              done
+              if [ "$radium_installed" = "0" ]; then
+                  mkdir -p /sdcard/Radium-monitor
+                  cp -f "$AKHOME/qca_cld3_qca6750.ko" /sdcard/Radium-monitor/ 2>/dev/null || true
+                  echo "  - Radium: could not auto-install .ko (vendor_dlkm not mounted rw)"
+                  echo "  - Radium: .ko copied to /sdcard/Radium-monitor/ if /sdcard is accessible"
+                  echo "  - Radium: use the Magisk module for guaranteed installation"
+              fi
+          fi
+          ## end Radium custom
+          AKEOF
+          # --- END CAVEAT-1 FIX ---
+
           STAMP="$(date -u +%Y%m%d)"
           SHA="$(git rev-parse --short=7 HEAD 2>/dev/null || echo local)"
           ZIP_NAME="${ZIP_PREFIX}-${FLAVOR}-${ZIP_VERSION}-${STAMP}-${SHA}.zip"
@@ -319,7 +356,7 @@ jobs:
           rm -rf "$STAGE"
           log "Packaged unified flashable zip: $DIST/$ZIP_NAME"
 
-          # 6. Build Universal Magisk/KernelSU Module
+          # 6. Build Universal Magisk/KernelSU Module (unchanged)
           if [[ -f "$QCACLD_DIR/qca_cld3_qca6750.ko" ]]; then
             log "Packaging Universal Magisk/KernelSU Module..."
             MAGISK_DIR="$(mktemp -d)"
