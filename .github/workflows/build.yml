@@ -2,7 +2,7 @@ name: Build Radium Kernel & Monitor Wi-Fi
 
 on:
   push:
-    branches: [ "17", "main", "master" ]
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 permissions:
@@ -62,7 +62,7 @@ jobs:
           cd "$ROOT"
 
           # Target redzrush101's SM8635 modules repository
-          PATCHED_MODULES_REPO="https://github.com/redzrush101/android_kernel_xiaomi_sm8635-modules.git"
+          PATCHED_MODULES_REPO="https://github.com/Harshit-2077/android_kernel_xiaomi_sm8635-modules.git"
           ANYKERNEL_REPO="https://github.com/osm0sis/AnyKernel3.git"
 
           export PATH="$CLANG_DIR/bin:$PATH"
