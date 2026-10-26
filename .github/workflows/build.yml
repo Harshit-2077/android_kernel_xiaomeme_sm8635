@@ -61,7 +61,7 @@ jobs:
           ROOT="$GITHUB_WORKSPACE"
           cd "$ROOT"
 
-          PATCHED_MODULES_REPO="https://github.com/Harshit-2077/android_kernel_xiaomi_sm8635-module.git"
+          PATCHED_MODULES_REPO="https://github.com/Harshit-2077/android_kernel_xiaomi_sm8635-modules.git"
           ANYKERNEL_REPO="https://github.com/osm0sis/AnyKernel3.git"
 
           export PATH="$CLANG_DIR/bin:$PATH"
