@@ -113,6 +113,27 @@ jobs:
           log "config + ThinLTO + Wireless dependencies..."
           ./scripts/config --file "$OUT/.config" \
             --set-str LOCALVERSION "-Lucy-Monitor" \
+            -d LOCALVERSION_AUTO \
+            -d WERROR \
+            --set-val UCLAMP_BUCKETS_COUNT 20 \
+            -d TASK_DELAY_ACCT \
+            -d RSEQ \
+            -d SCHED_CLUSTER \
+            -e SCHED_MC \
+            -e SCHED_HRTICK \
+            -e RT_SOFTIRQ_AWARE_SCHED \
+            -e RCU_BOOST \
+            -e RCU_LAZY \
+            -e RCU_LAZY_DEFAULT_OFF \
+            -e BOEFFLA_WL_BLOCKER \
+            -e UNWIND_TABLES \
+            -e UNWIND_PATCH_PAC_INTO_SCS \
+            -e DYNAMIC_SCS \
+            -d HZ_100 \
+            -e HZ_250 \
+            -d HZ_300 \
+            -d HZ_1000 \
+            --set-val HZ 250 \
             -d LTO_NONE \
             -d LTO_CLANG_FULL \
             -e LTO \
