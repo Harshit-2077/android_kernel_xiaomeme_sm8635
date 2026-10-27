@@ -119,6 +119,8 @@ jobs:
             -e LTO_CLANG \
             -e LTO_CLANG_THIN \
             -e CFI_CLANG \
+            -d MODULE_SIG \
+            -d MODULE_SIG_FORCE \
             -d MODULE_SIG_ALL \
             -m MI_HARDWARE_ID \
             -m RFKILL \
