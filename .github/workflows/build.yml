@@ -1,4 +1,4 @@
-name: Build Radium Kernel & Monitor Wi-Fi
+name: Build Lucy Kernel & Monitor Wi-Fi
 
 on:
   push:
@@ -39,7 +39,7 @@ jobs:
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: radium-sm8635-ccache
+          key: Lucy-sm8635-ccache
           max-size: 2G
 
       - name: Setup Neutron Clang Toolchain (with glibc 2.39 patch)
@@ -57,7 +57,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          FLAVOR="radium-monitor"
+          FLAVOR="Lucy-monitor"
           ROOT="$GITHUB_WORKSPACE"
           cd "$ROOT"
 
@@ -69,13 +69,13 @@ jobs:
           export SUBARCH=arm64
           export LLVM=1
           export LLVM_IAS=1
-          export KBUILD_BUILD_USER="Raju-yeager"
-          export KBUILD_BUILD_HOST="Radium"
+          export KBUILD_BUILD_USER="Harshit-2077"
+          export KBUILD_BUILD_HOST="Lucy"
 
           OUT="$ROOT/out"
           DIST="$ROOT/dist"
           JOBS="$(nproc --all)"
-          ZIP_PREFIX="Radium-Monitor"
+          ZIP_PREFIX="Lucy-Monitor"
           ZIP_VERSION="v1.0"
 
           WARN_FLAGS="-Wno-error -Wno-gnu-zero-variadic-macro-arguments -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-format"
@@ -110,20 +110,13 @@ jobs:
             fi
           done
 
-          log "Applying Vibranium config + ThinLTO + Wireless dependencies..."
+          log "config + ThinLTO + Wireless dependencies..."
           ./scripts/config --file "$OUT/.config" \
-            --set-str LOCALVERSION "-Radium-Monitor" \
+            --set-str LOCALVERSION "-Lucy-Monitor" \
             -d LOCALVERSION_AUTO \
             -d WERROR \
             --set-val UCLAMP_BUCKETS_COUNT 20 \
             -d TASK_DELAY_ACCT \
-            -d CFS_BANDWIDTH \
-            -d RT_GROUP_SCHED \
-            -d CGROUP_PIDS \
-            -d CGROUP_DEVICE \
-            -d CGROUP_PERF \
-            -d CGROUP_MISC \
-            -d USER_NS \
             -d RSEQ \
             -d SCHED_CLUSTER \
             -e SCHED_MC \
@@ -148,9 +141,6 @@ jobs:
             -e LTO_CLANG_THIN \
             -e CFI_CLANG \
             -d MODULE_SIG_ALL \
-            -e MODULE_SIG_SHA256 \
-            -d MODULE_SIG_SHA512 \
-            --set-str MODULE_SIG_HASH "sha256" \
             -m MI_HARDWARE_ID \
             -m RFKILL \
             -m CFG80211 \
@@ -319,33 +309,33 @@ jobs:
           # we drop the .ko on /sdcard so the Magisk module remains the fallback.
           cat << 'AKEOF' >> "$STAGE/anykernel.sh"
 
-          ## Radium: install monitor-mode wlan module (best effort)
+          ## Lucy: install monitor-mode wlan module (best effort)
           if [ -f "$AKHOME/qca_cld3_qca6750.ko" ]; then
-              radium_installed=0
-              for radium_tgt in /vendor_dlkm/lib/modules/qca_cld3_qca6750.ko /vendor/lib/modules/qca_cld3_qca6750.ko; do
-                  radium_tdir=$(dirname "$radium_tgt")
-                  radium_tdev=$(echo "$radium_tgt" | cut -d/ -f1-2)
-                  if [ -d "$radium_tdir" ]; then
-                      mount -o rw,remount "$radium_tdev" 2>/dev/null || true
-                      if cp -f "$AKHOME/qca_cld3_qca6750.ko" "$radium_tgt" 2>/dev/null; then
-                          chmod 644 "$radium_tgt"
-                          chown 0:0 "$radium_tgt" 2>/dev/null || true
-                          restorecon "$radium_tgt" 2>/dev/null || true
-                          echo "  - Radium: installed qca_cld3_qca6750.ko to $radium_tdir"
-                          radium_installed=1
+              Lucy_installed=0
+              for Lucy_tgt in /vendor_dlkm/lib/modules/qca_cld3_qca6750.ko /vendor/lib/modules/qca_cld3_qca6750.ko; do
+                  Lucy_tdir=$(dirname "$Lucy_tgt")
+                  Lucy_tdev=$(echo "$Lucy_tgt" | cut -d/ -f1-2)
+                  if [ -d "$Lucy_tdir" ]; then
+                      mount -o rw,remount "$Lucy_tdev" 2>/dev/null || true
+                      if cp -f "$AKHOME/qca_cld3_qca6750.ko" "$Lucy_tgt" 2>/dev/null; then
+                          chmod 644 "$Lucy_tgt"
+                          chown 0:0 "$Lucy_tgt" 2>/dev/null || true
+                          restorecon "$Lucy_tgt" 2>/dev/null || true
+                          echo "  - Lucy: installed qca_cld3_qca6750.ko to $Lucy_tdir"
+                          Lucy_installed=1
                           break
                       fi
                   fi
               done
-              if [ "$radium_installed" = "0" ]; then
-                  mkdir -p /sdcard/Radium-monitor
-                  cp -f "$AKHOME/qca_cld3_qca6750.ko" /sdcard/Radium-monitor/ 2>/dev/null || true
-                  echo "  - Radium: could not auto-install .ko (vendor_dlkm not mounted rw)"
-                  echo "  - Radium: .ko copied to /sdcard/Radium-monitor/ if /sdcard is accessible"
-                  echo "  - Radium: use the Magisk module for guaranteed installation"
+              if [ "$Lucy_installed" = "0" ]; then
+                  mkdir -p /sdcard/Lucy-monitor
+                  cp -f "$AKHOME/qca_cld3_qca6750.ko" /sdcard/Lucy-monitor/ 2>/dev/null || true
+                  echo "  - Lucy: could not auto-install .ko (vendor_dlkm not mounted rw)"
+                  echo "  - Lucy: .ko copied to /sdcard/Lucy-monitor/ if /sdcard is accessible"
+                  echo "  - Lucy: use the Magisk module for guaranteed installation"
               fi
           fi
-          ## end Radium custom
+          ## end Lucy custom
           AKEOF
           # --- END CAVEAT-1 FIX ---
 
@@ -368,7 +358,7 @@ jobs:
             echo "#MAGISK" > "$MAGISK_DIR/META-INF/com/google/android/updater-script"
 
             cat << 'EOF' > "$MAGISK_DIR/module.prop"
-          id=eviltwin-wifi
+          id=Lucy-wifi
           name=Universal QCA6750 Monitor Mode Wi-Fi
           version=v1.0
           versionCode=1
@@ -404,7 +394,7 @@ jobs:
 
             cat << 'EOF' > "$MAGISK_DIR/system/bin/wlan-mode"
           #!/system/bin/sh
-          MODDIR="/data/adb/modules/eviltwin-wifi"
+          MODDIR="/data/adb/modules/Lucy-wifi"
           STOCK_KO=$(find /vendor_dlkm /vendor /system -type f -name qca_cld3_qca6750.ko | head -n 1)
           MOD_KO="$MODDIR/qca_cld3_qca6750.ko"
 
@@ -434,15 +424,15 @@ jobs:
           EOF
             chmod +x "$MAGISK_DIR/system/bin/wlan-mode"
 
-            (cd "$MAGISK_DIR" && zip -r9q "$DIST/Universal-EvilTwin-WiFi-Magisk-${ZIP_VERSION}.zip" .)
+            (cd "$MAGISK_DIR" && zip -r9q "$DIST/Universal-Lucy-WiFi-Magisk-${ZIP_VERSION}.zip" .)
             rm -rf "$MAGISK_DIR"
-            log "Packaged Universal Magisk Module: $DIST/Universal-EvilTwin-WiFi-Magisk-${ZIP_VERSION}.zip"
+            log "Packaged Universal Magisk Module: $DIST/Universal-Lucy-WiFi-Magisk-${ZIP_VERSION}.zip"
           fi
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Radium-SM8635-Packages-${{ github.sha }}
+          name: Lucy-SM8635-Packages-${{ github.sha }}
           path: |
             dist/*.zip
             dist/Image-*
@@ -452,7 +442,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Radium-Build-Logs-Debug
+          name: Lucy-Build-Logs-Debug
           path: |
             out/*.log
           if-no-files-found: ignore
