@@ -34,7 +34,8 @@ jobs:
           sudo apt-get install -y \
             bc bison build-essential ccache curl file flex git libelf-dev \
             libncurses-dev libssl-dev lld llvm pahole patch patchelf \
-            python3 rsync unzip wget zip zstd
+            python3 rsync unzip wget zip zstd \
+            mkbootimg android-sdk-libsparse-utils
 
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -178,7 +179,60 @@ jobs:
           cp -f "$OUT/Module.symvers" "$DIST/Module.symvers-$FLAVOR"
           cp -f "$OUT/.config" "$DIST/config-$FLAVOR"
 
-          # 4. Clone modules repo (pinned to the branch carrying our monitor-mode fix)
+          # 4. Build DTB + DTBO
+          log "Building device tree blobs (dtbs)..."
+          if ! make -j"$JOBS" O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
+            dtbs 2>&1 | tee "$OUT/dtbs_build.log"; then
+            echo "::error::DTB build failed! Printing errors from dtbs_build.log:"
+            grep -n -C 5 -E "(error:|fatal error:|Error:|Syntax error)" "$OUT/dtbs_build.log" || true
+            exit 1
+          fi
+
+          DTB_OUT_DIR="$OUT/arch/arm64/boot/dts"
+
+          # Ensure mkdtimg is available (apt mkbootimg usually ships it on 24.04;
+          # otherwise build from AOSP libufdt as a fallback).
+          if ! command -v mkdtimg >/dev/null 2>&1; then
+            log "mkdtimg not in PATH; building from AOSP libufdt source..."
+            rm -rf "$ROOT/libufdt_src"
+            if git clone --depth=1 https://android.googlesource.com/platform/system/libufdt "$ROOT/libufdt_src"; then
+              (cd "$ROOT/libufdt_src" && make -j"$JOBS" utils 2>/dev/null || true)
+              MKDTIMG_BIN=$(find "$ROOT/libufdt_src" -type f -name mkdtimg -perm -u+x | head -n1)
+              if [[ -n "${MKDTIMG_BIN:-}" ]]; then
+                export PATH="$(dirname "$MKDTIMG_BIN"):$PATH"
+                log "Built mkdtimg at $MKDTIMG_BIN"
+              fi
+            fi
+          fi
+
+          mapfile -d '' DTBO_ARRAY < <(find "$DTB_OUT_DIR" -type f -name '*.dtbo' -print0 2>/dev/null || true)
+
+          if [[ ${#DTBO_ARRAY[@]} -gt 0 ]]; then
+            if command -v mkdtimg >/dev/null 2>&1; then
+              DTBO_IMG="$DIST/dtbo-$FLAVOR.img"
+              log "Packaging dtbo.img from ${#DTBO_ARRAY[@]} overlay(s)..."
+              if mkdtimg create "$DTBO_IMG" "${DTBO_ARRAY[@]}" 2>&1 | tee "$OUT/mkdtimg.log"; then
+                log "Packaged dtbo.img: $DTBO_IMG ($(du -h "$DTBO_IMG" | cut -f1))"
+              else
+                echo "::warning::mkdtimg failed; see $OUT/mkdtimg.log"
+              fi
+            else
+              echo "::warning::mkdtimg unavailable; dtbo.img NOT generated (${#DTBO_ARRAY[@]} .dtbo files exist)"
+            fi
+          else
+            echo "::warning::No .dtbo files under $DTB_OUT_DIR; dtbo.img skipped"
+          fi
+
+          # Also export raw .dtb files for reference
+          mkdir -p "$DIST/dtb-$FLAVOR"
+          mapfile -d '' DTB_ARRAY < <(find "$DTB_OUT_DIR" -type f -name '*.dtb' -print0 2>/dev/null || true)
+          if [[ ${#DTB_ARRAY[@]} -gt 0 ]]; then
+            cp -f "${DTB_ARRAY[@]}" "$DIST/dtb-$FLAVOR/"
+            log "Copied ${#DTB_ARRAY[@]} raw .dtb file(s) to dist/dtb-$FLAVOR/"
+          fi
+
+          # 5. Clone modules repo (pinned to the branch carrying our monitor-mode fix)
           log "Cloning SM8635 modules from $PATCHED_MODULES_REPO (branch lineage-23.2)..."
           rm -rf "$ROOT/modules_src"
           git clone --depth=1 --branch lineage-23.2 "$PATCHED_MODULES_REPO" "$ROOT/modules_src"
@@ -289,7 +343,7 @@ jobs:
 
           llvm-strip --strip-debug "$QCACLD_DIR/qca_cld3_qca6750.ko"
 
-          # 5. Package Unified AnyKernel3 Zip
+          # 6. Package Unified AnyKernel3 Zip
           STAGE="$(mktemp -d)"
           git clone --depth=1 "$ANYKERNEL_REPO" "$STAGE"
           rm -rf "$STAGE/.git"
@@ -301,6 +355,10 @@ jobs:
           cp -f "$IMG" "$STAGE/Image"
           if [[ -f "$QCACLD_DIR/qca_cld3_qca6750.ko" ]]; then
             cp -f "$QCACLD_DIR/qca_cld3_qca6750.ko" "$STAGE/qca_cld3_qca6750.ko"
+          fi
+          # Ship dtbo.img inside the flashable zip too (for manual fastboot users)
+          if [[ -f "$DIST/dtbo-$FLAVOR.img" ]]; then
+            cp -f "$DIST/dtbo-$FLAVOR.img" "$STAGE/dtbo.img"
           fi
 
           # --- CAVEAT-1 FIX: install the .ko via anykernel.sh (best-effort) ---
@@ -348,7 +406,7 @@ jobs:
           rm -rf "$STAGE"
           log "Packaged unified flashable zip: $DIST/$ZIP_NAME"
 
-          # 6. Build Universal Magisk/KernelSU Module (unchanged)
+          # 7. Build Universal Magisk/KernelSU Module (unchanged)
           if [[ -f "$QCACLD_DIR/qca_cld3_qca6750.ko" ]]; then
             log "Packaging Universal Magisk/KernelSU Module..."
             MAGISK_DIR="$(mktemp -d)"
@@ -431,14 +489,13 @@ jobs:
             log "Packaged Universal Magisk Module: $DIST/Universal-Lucy-WiFi-Magisk-${ZIP_VERSION}.zip"
           fi
 
-          # 7. Collect ALL .ko modules into a single zip
+          # 8. Collect ALL .ko modules into a single zip
           #    (in-tree kernel modules + out-of-tree WLAN + anything shipped in modules_src)
           log "Collecting every .ko into a single module archive..."
           KO_STAGE="$DIST/ko-collection"
           rm -rf "$KO_STAGE"
           mkdir -p "$KO_STAGE"
 
-          # Helper: copy .ko files (any compression suffix) preserving relative path
           collect_kos() {
             local src_root="$1" dest_prefix="$2"
             [[ -d "$src_root" ]] || return 0
@@ -451,19 +508,15 @@ jobs:
                        -not -path '*/.git/*' -print0)
           }
 
-          # In-tree kernel modules (built by `make modules`)
           collect_kos "$OUT"              "in-tree"
-          # Out-of-tree WLAN module
           collect_kos "$QCACLD_DIR"       "out-of-tree/wlan"
-          # Anything else shipped in the cloned modules_src tree
           collect_kos "$ROOT/modules_src" "modules_src"
 
-          # Reference files
           [[ -f "$OUT/Module.symvers" ]] && cp -f "$OUT/Module.symvers" "$KO_STAGE/Module.symvers"
           [[ -f "$OUT/.config"       ]] && cp -f "$OUT/.config"        "$KO_STAGE/kernel.config"
           [[ -f "$IMG"               ]] && cp -f "$IMG"               "$KO_STAGE/Image"
+          [[ -f "$DIST/dtbo-$FLAVOR.img" ]] && cp -f "$DIST/dtbo-$FLAVOR.img" "$KO_STAGE/dtbo.img"
 
-          # Manifest
           {
             echo "Lucy module collection"
             echo "Kernel:    $(head -n 4 "$ROOT/Makefile" | tr '\n' ' ')"
@@ -479,6 +532,7 @@ jobs:
             echo "  Module.symvers      kernel symbol version map"
             echo "  kernel.config       resolved .config"
             echo "  Image               built boot Image (if any)"
+            echo "  dtbo.img            device-tree overlay image (if generated)"
             echo ""
             echo "Modules ($(find "$KO_STAGE" -type f -name '*.ko*' | wc -l) total):"
             find "$KO_STAGE" -type f -name '*.ko*' | sed "s|$KO_STAGE/||" | sort
@@ -498,6 +552,8 @@ jobs:
           path: |
             dist/*.zip
             dist/Image-*
+            dist/dtbo-*.img
+            dist/dtb-*/*
           if-no-files-found: error
 
       - name: Upload Logs on Failure
