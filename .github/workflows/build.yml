@@ -431,6 +431,66 @@ jobs:
             log "Packaged Universal Magisk Module: $DIST/Universal-Lucy-WiFi-Magisk-${ZIP_VERSION}.zip"
           fi
 
+          # 7. Collect ALL .ko modules into a single zip
+          #    (in-tree kernel modules + out-of-tree WLAN + anything shipped in modules_src)
+          log "Collecting every .ko into a single module archive..."
+          KO_STAGE="$DIST/ko-collection"
+          rm -rf "$KO_STAGE"
+          mkdir -p "$KO_STAGE"
+
+          # Helper: copy .ko files (any compression suffix) preserving relative path
+          collect_kos() {
+            local src_root="$1" dest_prefix="$2"
+            [[ -d "$src_root" ]] || return 0
+            while IFS= read -r -d '' ko; do
+              local rel="${ko#$src_root/}"
+              mkdir -p "$KO_STAGE/$dest_prefix/$(dirname "$rel")"
+              cp -f "$ko" "$KO_STAGE/$dest_prefix/$rel"
+            done < <(find "$src_root" -type f \
+                       \( -name '*.ko' -o -name '*.ko.gz' -o -name '*.ko.xz' -o -name '*.ko.zst' \) \
+                       -not -path '*/.git/*' -print0)
+          }
+
+          # In-tree kernel modules (built by `make modules`)
+          collect_kos "$OUT"              "in-tree"
+          # Out-of-tree WLAN module
+          collect_kos "$QCACLD_DIR"       "out-of-tree/wlan"
+          # Anything else shipped in the cloned modules_src tree
+          collect_kos "$ROOT/modules_src" "modules_src"
+
+          # Reference files
+          [[ -f "$OUT/Module.symvers" ]] && cp -f "$OUT/Module.symvers" "$KO_STAGE/Module.symvers"
+          [[ -f "$OUT/.config"       ]] && cp -f "$OUT/.config"        "$KO_STAGE/kernel.config"
+          [[ -f "$IMG"               ]] && cp -f "$IMG"               "$KO_STAGE/Image"
+
+          # Manifest
+          {
+            echo "Lucy module collection"
+            echo "Kernel:    $(head -n 4 "$ROOT/Makefile" | tr '\n' ' ')"
+            echo "Toolchain: $(clang --version | head -n 1)"
+            echo "Commit:    $(git rev-parse HEAD 2>/dev/null || echo unknown)"
+            echo "Date:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "HOST:      ${KBUILD_BUILD_HOST}  USER: ${KBUILD_BUILD_USER}"
+            echo ""
+            echo "Layout:"
+            echo "  in-tree/            modules built from the kernel tree"
+            echo "  out-of-tree/wlan/   qca_cld3_qca6750.ko built out-of-tree"
+            echo "  modules_src/        any .ko shipped in the cloned modules repo"
+            echo "  Module.symvers      kernel symbol version map"
+            echo "  kernel.config       resolved .config"
+            echo "  Image               built boot Image (if any)"
+            echo ""
+            echo "Modules ($(find "$KO_STAGE" -type f -name '*.ko*' | wc -l) total):"
+            find "$KO_STAGE" -type f -name '*.ko*' | sed "s|$KO_STAGE/||" | sort
+          } > "$KO_STAGE/README.txt"
+
+          KO_ZIP="$DIST/Lucy-All-Modules-${ZIP_VERSION}-${STAMP}-${SHA}.zip"
+          (cd "$KO_STAGE" && zip -r9q "$KO_ZIP" .)
+          KO_COUNT=$(find "$KO_STAGE" -type f -name '*.ko*' | wc -l)
+          KO_SIZE=$(du -h "$KO_ZIP" | cut -f1)
+          rm -rf "$KO_STAGE"
+          log "Packaged $KO_COUNT modules into $KO_ZIP ($KO_SIZE)"
+
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
