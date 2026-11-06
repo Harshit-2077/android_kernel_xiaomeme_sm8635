@@ -48,6 +48,8 @@ env:
   # Global Paths (Available to all steps)
   FLAVOR: "Lucy-monitor"
   ROOT: "${{ github.workspace }}/kernel_src"
+  ROOT_DIR: "${{ github.workspace }}/kernel_src"
+  KERNEL_DIR: "."  # FIX: Tells build.config the kernel is at the root
   OUT: "${{ github.workspace }}/out"
   DIST: "${{ github.workspace }}/dist"
   DYNAMIC_CACHE_DIR: "${{ github.workspace }}/out/dynamic_cache"
@@ -265,10 +267,12 @@ jobs:
           cd "$ROOT"
           echo "::endgroup::"
 
+          set +u
           if declare -f compile_system_dlkm_modules > /dev/null; then
             echo "Executing compile_system_dlkm_modules from build.config..."
             compile_system_dlkm_modules
           fi
+          set -u
 
           make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
@@ -294,7 +298,6 @@ jobs:
           depmod -b . "$UNAME"
           cd "$ROOT"
           
-          # Save UNAME for the next steps
           echo "UNAME=$UNAME" >> "$GITHUB_ENV"
           echo "::endgroup::"
 
@@ -318,7 +321,6 @@ jobs:
           set -euo pipefail
           cd "$ROOT"
           
-          # Re-source build.config to get the EXT_MODULES array into this shell
           BUILD_CONFIG="$KERNEL_KIT/device/peridot-los23.2/build_config/build.config.peridot.los23.2"
           set +u
           source "$BUILD_CONFIG"
@@ -334,7 +336,6 @@ jobs:
           curl -sL https://android.googlesource.com/kernel/build/+/refs/heads/main/build_utils.sh?format=TEXT | base64 -d > "$ROOT/build_utils.sh"
           source "$ROOT/build_utils.sh"
 
-          # system_dlkm
           SYS_STAGE="$OUT/system_dlkm_staging"
           rm -rf "$SYS_STAGE" && mkdir -p "$SYS_STAGE/lib/modules/$UNAME"
           SYS_LIST="$KERNEL_KIT/device/peridot-los23.2/system_dlkm/system_dlkm.modules.include"
@@ -359,7 +360,6 @@ jobs:
           build_image "$SYS_STAGE" "$system_dlkm_props_file" "$DIST/system_dlkm.img" /dev/null
           avbtool add_hashtree_footer --partition_name system_dlkm --hash_algorithm sha256 --image "$DIST/system_dlkm.img" --do_not_generate_fec
 
-          # vendor_dlkm
           VEND_STAGE="$OUT/vendor_dlkm_staging"
           rm -rf "$VEND_STAGE" && mkdir -p "$VEND_STAGE/lib/modules/$UNAME"
           VEND_LIST="$KERNEL_KIT/device/peridot-los23.2/vendor_dlkm/vendor_dlkm.modules.include"
@@ -390,6 +390,7 @@ jobs:
           for EXT_MOD in "${EXT_MODULES[@]}"; do
             EXT_MOD_ACTUAL=$(echo "$EXT_MOD" | sed "s/\.\${QCACLD_DEV_NAME}/.qca6750/")
             
+            # Check if directory exists in our symlinked vendor tree
             if [[ ! -d "$ROOT/$EXT_MOD_ACTUAL" ]]; then
               echo "WARNING: The following module path does not exist : $EXT_MOD_ACTUAL" >&2
               continue
@@ -398,6 +399,7 @@ jobs:
             echo "Building $EXT_MOD_ACTUAL..."
             
             if [[ "$EXT_MOD_ACTUAL" == *"qcacld-3.0"* ]]; then
+              # WLAN Module
               TARGET_DIR="$ROOT/$EXT_MOD_ACTUAL"
               echo "Applying monitor mode configs to WLAN..."
               ln -sfn ../qca-wifi-host-cmn "$TARGET_DIR/cmn"
@@ -420,6 +422,7 @@ jobs:
 
               llvm-strip --strip-debug "$TARGET_DIR/qca_cld3_qca6750.ko"
             else
+              # Other Modules
               CLEAN_PATH=$(echo "$EXT_MOD_ACTUAL" | sed 's|^\.\./vendor/||')
               
               make -j$(nproc --all) -C "$ROOT" O="$OUT" M="$EXT_MOD_ACTUAL" \
