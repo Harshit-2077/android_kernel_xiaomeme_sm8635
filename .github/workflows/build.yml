@@ -386,7 +386,19 @@ jobs:
             # Per-module extra include paths (absolute: the compiler runs from $OUT, not the module dir)
             MOD_INC=""
             if [[ "$EXT_MOD_ACTUAL" == *"audio-kernel"* ]]; then
-              MOD_INC="-I$(realpath "$ROOT/$EXT_MOD_ACTUAL")/include"
+              AUDIO_DIR="$(realpath "$ROOT/$EXT_MOD_ACTUAL")"
+              MOD_INC="-I$AUDIO_DIR/include"
+
+              # The command-line KCFLAGS/EXTRA_CFLAGS can hide the module's own include/config flags,
+              # so force-include the SoC config header that defines CONFIG_SND_* (e.g. CONFIG_SND_EVENT).
+              echo "audio-kernel config dir:"; ls "$AUDIO_DIR/config" || true
+              AUDIO_CONF_H=$(grep -l "CONFIG_SND_SOC_PINEAPPLE" "$AUDIO_DIR"/config/*.h 2>/dev/null | head -n1 || true)
+              if [[ -n "$AUDIO_CONF_H" ]]; then
+                echo "Force-including $AUDIO_CONF_H"
+                MOD_INC="$MOD_INC -include $AUDIO_CONF_H"
+              else
+                echo "WARNING: no audio config header found in $AUDIO_DIR/config" >&2
+              fi
             fi
             
             # Patch securemsm-kernel specifically to remove -Werror and stringify issues
