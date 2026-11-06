@@ -115,7 +115,7 @@ jobs:
           ./antman -S
           ./antman --patch=glibc
           
-          # Fix: Add clang to GITHUB_PATH so ALL subsequent steps use it
+          # Add clang to GITHUB_PATH so ALL subsequent steps use it
           echo "CLANG_DIR=$HOME/clang" >> "$GITHUB_ENV"
           echo "$HOME/clang/bin" >> "$GITHUB_PATH"
 
@@ -404,6 +404,9 @@ jobs:
             
             EXT_MOD_REL=$(realpath -s --relative-to="$ROOT" "$TARGET_DIR")
             
+            # FIX: Force include linux/stringify.h for securemsm-kernel
+            EXTRA_CFLAGS="$WARN_FLAGS -include linux/stringify.h"
+            
             if [[ "$EXT_MOD_ACTUAL" == *"qcacld-3.0"* ]]; then
               echo "Applying monitor mode configs to WLAN..."
               ln -sfn ../qca-wifi-host-cmn "$TARGET_DIR/cmn"
@@ -422,7 +425,7 @@ jobs:
                 CONFIG_QCA_WIFI_2_0=1 WLAN_PROFILE=qca6750 CONFIG_QCA_CLD_WLAN_PROFILE=qca6750 \
                 CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y DYNAMIC_SINGLE_CHIP=qca6750 DEVNAME=qca6750 \
                 MODNAME=qca_cld3_qca6750 CONFIG_QCA_CLD_WLAN=m \
-                KCFLAGS="$WARN_FLAGS -DFEATURE_MONITOR_MODE_SUPPORT -DCONFIG_FEATURE_MONITOR_MODE_SUPPORT=1" \
+                KCFLAGS="$EXTRA_CFLAGS -DFEATURE_MONITOR_MODE_SUPPORT -DCONFIG_FEATURE_MONITOR_MODE_SUPPORT=1" \
                 modules 2>&1 | tee "$OUT/wlan_build.log"
 
               llvm-strip --strip-debug "$TARGET_DIR/qca_cld3_qca6750.ko"
@@ -430,7 +433,7 @@ jobs:
               make -j$(nproc --all) -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
                 ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
                 KERNEL_SRC="$ROOT" CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
-                KCFLAGS="$WARN_FLAGS" \
+                KCFLAGS="$EXTRA_CFLAGS" \
                 modules
                 
               make -j$(nproc --all) -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
