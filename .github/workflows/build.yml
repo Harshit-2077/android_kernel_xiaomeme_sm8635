@@ -363,6 +363,7 @@ jobs:
             CC="ccache clang"
             KERNEL_SRC="$ROOT"
             KCFLAGS="$WARN_FLAGS"
+            EXTRA_CFLAGS="$WARN_FLAGS -include linux/stringify.h"
           )
 
           EXTRA_SYMBOLS=""
@@ -378,6 +379,14 @@ jobs:
             echo "Building $EXT_MOD_ACTUAL..."
             
             EXT_MOD_REL=$(realpath -s --relative-to="$ROOT" "$ROOT/$EXT_MOD_ACTUAL")
+            
+            # Patch securemsm-kernel specific errors
+            if [[ "$EXT_MOD_ACTUAL" == *"securemsm-kernel"* ]]; then
+              echo "Patching trace_smcinvoke.h for securemsm-kernel..."
+              if [[ -f "$ROOT/$EXT_MOD_ACTUAL/smcinvoke/compat/trace_smcinvoke.h" ]]; then
+                sed -i 's/__stringify(\(.*\))/\1/g' "$ROOT/$EXT_MOD_ACTUAL/smcinvoke/compat/trace_smcinvoke.h" || true
+              fi
+            fi
             
             if [[ "$EXT_MOD_ACTUAL" == *"qcacld-3.0"* ]]; then
               TARGET_DIR="$ROOT/$EXT_MOD_ACTUAL"
