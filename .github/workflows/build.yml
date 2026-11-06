@@ -24,9 +24,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Cache key for the build. Bump the 'v1' if you change toolchains or make major config changes.
-  CACHE_KEY: cache-Lucy-peridot-${{ github.sha }} 
-  # Actually, using commit SHA means a new cache every push. Better to use a static key:
+  # Static key means it will always overwrite the same cache slot. 
+  # Bump to 'v2' if you change toolchains or major kernel configs.
   CACHE_KEY_STATIC: cache-Lucy-peridot-v1
   OUT_DIR: ${{ github.workspace }}/out
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -96,16 +95,17 @@ jobs:
           export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
           export KBUILD_BUILD_USER="Harshit-2077" KBUILD_BUILD_HOST="Lucy"
           
-          # Environment variables required by the build.config
+          # Environment variables required by the build.config & mtime script
           export ROOT_DIR="$ROOT"
           export KERNEL_DIR="$ROOT" 
           export SOC="cliffs"
           export CODENAME="peridot"
           export OS_SHORT="los23.2"
           export QCACLD_DEV_NAME="qca6750"
+          export DYNAMIC_CACHE_DIR="$OUT_DIR/dynamic_cache"
 
           OUT="$ROOT/out"; DIST="$ROOT/dist"; JOBS="$(nproc --all)"
-          rm -rf "$DIST"; mkdir -p "$OUT" "$DIST"
+          rm -rf "$DIST"; mkdir -p "$OUT" "$DIST" "$DYNAMIC_CACHE_DIR"
           WARN_FLAGS="-Wno-error -Wno-gnu-zero-variadic-macro-arguments -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-format"
 
           # Setup ccache inside OUT_DIR so it gets cached along with build artifacts
