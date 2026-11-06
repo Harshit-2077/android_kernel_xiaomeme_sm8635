@@ -51,6 +51,7 @@ jobs:
             python3 rsync unzip wget zip zstd device-tree-compiler \
             android-sdk-libsparse-utils mkbootimg
 
+          # Fetch avbtool
           curl -sL https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT | base64 -d | sudo tee /usr/local/bin/avbtool > /dev/null
           sudo chmod +x /usr/local/bin/avbtool
 
@@ -86,6 +87,13 @@ jobs:
           export PATH="$CLANG_DIR/bin:$PATH"
           export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
           export KBUILD_BUILD_USER="Harshit-2077" KBUILD_BUILD_HOST="Lucy"
+          
+          # Environment variables required by the build.config
+          export ROOT_DIR="$ROOT"
+          export KERNEL_DIR="$ROOT" 
+          export SOC="cliffs"
+          export CODENAME="peridot"
+          export OS_SHORT="los23.2"
 
           OUT="$ROOT/out"; DIST="$ROOT/dist"; JOBS="$(nproc --all)"
           rm -rf "$OUT" "$DIST"; mkdir -p "$OUT" "$DIST"
@@ -100,11 +108,26 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::1. Defconfig & Compile"
-          make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
-          for frag in arch/arm64/configs/vendor/pineapple_GKI.config arch/arm64/configs/vendor/peridot_GKI.config; do
-            [[ -f "$frag" ]] && ARCH=arm64 scripts/kconfig/merge_config.sh -m -O "$OUT" "$OUT/.config" "$frag"
-          done
+          # Source the build.config from kernel_kit
+          BUILD_CONFIG="$KERNEL_KIT/device/peridot-los23.2/build_config/build.config.peridot.los23.2"
+          if [[ -f "$BUILD_CONFIG" ]]; then
+            echo "Sourcing build config: $BUILD_CONFIG"
+            set -a
+            source "$BUILD_CONFIG"
+            set +a
+          else
+            echo "::error::build.config not found!"
+            exit 1
+          fi
 
+          # Apply Defconfigs from build.config
+          if [[ -v CONFIGS_GKI ]]; then
+            make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 "${CONFIGS_GKI[@]}"
+          else
+            make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+          fi
+
+          # Apply hardcoded tweaks (overrides build.config if needed)
           ./scripts/config --file "$OUT/.config" \
             --set-str LOCALVERSION "-Lucy-Monitor" -d LOCALVERSION_AUTO -d WERROR \
             --set-val UCLAMP_BUCKETS_COUNT 20 -d TASK_DELAY_ACCT -d RSEQ -d SCHED_CLUSTER \
@@ -117,16 +140,26 @@ jobs:
             -e CFG80211_REQUIRE_SIGNED_REGDB -e CFG80211_USE_KERNEL_REGDB_KEYS \
             -e CFG80211_DEFAULT_PS -d CFG80211_CRDA_SUPPORT -d CFG80211_WEXT -m MAC80211
           
+          # Call function from build.config to enable specific system_dlkm modules
+          if declare -f compile_system_dlkm_modules > /dev/null; then
+            echo "Executing compile_system_dlkm_modules from build.config..."
+            compile_system_dlkm_modules
+          fi
+          
           make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
-          make -j"$JOBS" O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
-            KBUILD_MODPOST_WARN=1 KCFLAGS="$WARN_FLAGS" \
-            Image modules
+
+          # Use MAKE_FLAGS if defined in build.config
+          K_MAKE_FLAGS=("-j$JOBS" "O=$OUT" "ARCH=arm64" "LLVM=1" "LLVM_IAS=1" "CC=ccache clang" "HOSTCC=ccache clang" "HOSTCXX=ccache clang++" "KBUILD_MODPOST_WARN=1" "KCFLAGS=$WARN_FLAGS")
+          if [[ -v MAKE_FLAGS ]]; then
+             K_MAKE_FLAGS=("${MAKE_FLAGS[@]}")
+          fi
+
+          make "${K_MAKE_FLAGS[@]}" Image modules
 
           cp -f "$OUT/arch/arm64/boot/Image" "$DIST/Image-$FLAVOR"
           cp -f "$OUT/.config" "$DIST/config-$FLAVOR"
 
-          make -j"$JOBS" O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_STRIP=1 modules_install
+          make "${K_MAKE_FLAGS[@]}" INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_STRIP=1 modules_install
           cd "$OUT/modules_staging"
           UNAME=$(ls lib/modules/)
           depmod -b . "$UNAME"
@@ -134,7 +167,8 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::2. Build system_dlkm & vendor_dlkm"
-          # system_dlkm
+          
+          # system_dlkm (Partition size: 7213056 bytes -> ~6MB FS)
           SYS_STAGE="$OUT/system_dlkm_staging"
           mkdir -p "$SYS_STAGE/lib/modules/$UNAME"
           SYS_LIST="$KERNEL_KIT/device/peridot-los23.2/system_dlkm/system_dlkm.modules.include"
@@ -146,10 +180,10 @@ jobs:
             done < "$SYS_LIST"
           fi
           cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$SYS_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
-          mke2fs -t ext4 -d "$SYS_STAGE" "$DIST/system_dlkm.img" 64M
-          avbtool add_hashtree_footer --partition_name system_dlkm --partition_size 67108864 --hash_algorithm sha256 --image "$DIST/system_dlkm.img" --do_not_generate_fec
+          mke2fs -t ext4 -d "$SYS_STAGE" "$DIST/system_dlkm.img" 6M
+          avbtool add_hashtree_footer --partition_name system_dlkm --partition_size 7213056 --hash_algorithm sha256 --image "$DIST/system_dlkm.img" --do_not_generate_fec
 
-          # vendor_dlkm
+          # vendor_dlkm (Partition size: 94502912 bytes -> ~80MB FS)
           VEND_STAGE="$OUT/vendor_dlkm_staging"
           mkdir -p "$VEND_STAGE/lib/modules/$UNAME"
           VEND_LIST="$KERNEL_KIT/device/peridot-los23.2/vendor_dlkm/vendor_dlkm.modules.include"
@@ -161,8 +195,8 @@ jobs:
             done < "$VEND_LIST"
           fi
           cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$VEND_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
-          mke2fs -t ext4 -d "$VEND_STAGE" "$DIST/vendor_dlkm.img" 256M
-          avbtool add_hashtree_footer --partition_name vendor_dlkm --partition_size 268435456 --hash_algorithm sha256 --image "$DIST/vendor_dlkm.img" --do_not_generate_fec
+          mke2fs -t ext4 -d "$VEND_STAGE" "$DIST/vendor_dlkm.img" 80M
+          avbtool add_hashtree_footer --partition_name vendor_dlkm --partition_size 94502912 --hash_algorithm sha256 --image "$DIST/vendor_dlkm.img" --do_not_generate_fec
           echo "::endgroup::"
 
           echo "::group::3. OOT WLAN Module Build"
@@ -180,7 +214,7 @@ jobs:
             M="$QCACLD_DIR" \
             CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
             WLAN_ROOT="$QCACLD_DIR" WLAN_COMMON_ROOT=cmn WLAN_COMMON_INC="$QCACLD_DIR/cmn" \
-            WLAN_FW_API="$WLAN_DIR/fw-api/" CONFIG_ARCH_PINEAPPLE=y CONFIG_ARCH_QCOM=y \
+            WLAN_FW_API="$WLAN_DIR/fw-api/" CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
             CONFIG_CNSS_OUT_OF_TREE=y CONFIG_IPA_OUT_OF_TREE=y CONFIG_QCA_WIFI_ISOC=0 \
             CONFIG_QCA_WIFI_2_0=1 WLAN_PROFILE=qca6750 CONFIG_QCA_CLD_WLAN_PROFILE=qca6750 \
             CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y DYNAMIC_SINGLE_CHIP=qca6750 DEVNAME=qca6750 \
@@ -223,6 +257,7 @@ jobs:
             --vendor_bootconfig "$BOOTCONFIG" \
             --vendor_boot "$DIST/vendor_boot.img"
 
+          # Partition size: 100663296 bytes (96MB)
           avbtool add_hash_footer --partition_name vendor_boot --partition_size 100663296 --image "$DIST/vendor_boot.img" --algorithm SHA256_RSA4096 --key "$KERNEL_KIT/tools/mkbootimg/gki/testdata/testkey_rsa4096.pem" 2>/dev/null || true
           echo "::endgroup::"
 
