@@ -480,18 +480,17 @@ jobs:
           WLAN_MOD_PATH="$GITHUB_WORKSPACE/modules_src/qcom/opensource/wlan/qcacld-3.0/qca_cld3_qca6750.ko"
           if [[ -f "$WLAN_MOD_PATH" ]]; then
             cp -f "$WLAN_MOD_PATH" "$STAGE/"
-            cat << 'AKEOF' >> "$STAGE/anykernel.sh"
-          if [ -f "$AKHOME/qca_cld3_qca6750.ko" ]; then
-              for Lucy_tgt in /vendor_dlkm/lib/modules/qca_cld3_qca6750.ko /vendor/lib/modules/qca_cld3_qca6750.ko; do
-                  Lucy_tdir=$(dirname "$Lucy_tgt")
-                  if [ -d "$Lucy_tdir" ]; then
-                      mount -o rw,remount "$(echo "$Lucy_tgt" | cut -d/ -f1-2)" 2>/dev/null || true
-                      cp -f "$AKHOME/qca_cld3_qca6750.ko" "$Lucy_tgt" 2>/dev/null && \
-                      { chmod 644 "$Lucy_tgt"; chown 0:0 "$Lucy_tgt"; restorecon "$Lucy_tgt" 2>/dev/null; break; }
-                  fi
-              done
-          fi
-AKEOF
+            
+            echo 'if [ -f "$AKHOME/qca_cld3_qca6750.ko" ]; then' >> "$STAGE/anykernel.sh"
+            echo '    for Lucy_tgt in /vendor_dlkm/lib/modules/qca_cld3_qca6750.ko /vendor/lib/modules/qca_cld3_qca6750.ko; do' >> "$STAGE/anykernel.sh"
+            echo '        Lucy_tdir=$(dirname "$Lucy_tgt")' >> "$STAGE/anykernel.sh"
+            echo '        if [ -d "$Lucy_tdir" ]; then' >> "$STAGE/anykernel.sh"
+            echo '            mount -o rw,remount "$(echo "$Lucy_tgt" | cut -d/ -f1-2)" 2>/dev/null || true' >> "$STAGE/anykernel.sh"
+            echo '            cp -f "$AKHOME/qca_cld3_qca6750.ko" "$Lucy_tgt" 2>/dev/null && \' >> "$STAGE/anykernel.sh"
+            echo '            { chmod 644 "$Lucy_tgt"; chown 0:0 "$Lucy_tgt"; restorecon "$Lucy_tgt" 2>/dev/null; break; }' >> "$STAGE/anykernel.sh"
+            echo '        fi' >> "$STAGE/anykernel.sh"
+            echo '    done' >> "$STAGE/anykernel.sh"
+            echo 'fi' >> "$STAGE/anykernel.sh"
           fi
 
           (cd "$STAGE" && zip -r9q "$DIST/Lucy-Monitor-${FLAVOR}-$(date -u +%Y%m%d)-$(cd "$ROOT" && git rev-parse --short=7 HEAD).zip" .)
