@@ -5,6 +5,16 @@ on:
     branches: [ "main", "master" ]
     paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'dist/**']
   workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Select release type'
+        required: true
+        type: choice
+        options:
+          - none
+          - Pre-release
+          - Release
+        default: none
 
 permissions:
   contents: write
@@ -41,7 +51,6 @@ jobs:
             python3 rsync unzip wget zip zstd device-tree-compiler \
             android-sdk-libsparse-utils mkbootimg
 
-          # Fetch avbtool
           curl -sL https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT | base64 -d | sudo tee /usr/local/bin/avbtool > /dev/null
           sudo chmod +x /usr/local/bin/avbtool
 
@@ -81,6 +90,14 @@ jobs:
           OUT="$ROOT/out"; DIST="$ROOT/dist"; JOBS="$(nproc --all)"
           rm -rf "$OUT" "$DIST"; mkdir -p "$OUT" "$DIST"
           WARN_FLAGS="-Wno-error -Wno-gnu-zero-variadic-macro-arguments -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-format"
+
+          echo "::group::0. Fix OpenSSL 3.0 key_pass"
+          if [[ -f "$ROOT/certs/extract-cert.c" ]]; then
+            sed -i '/static.*key_pass/d' "$ROOT/certs/extract-cert.c"
+            sed -i '1i __attribute__((unused)) static const char *key_pass;' "$ROOT/certs/extract-cert.c"
+            echo "Patched certs/extract-cert.c for OpenSSL 3.0"
+          fi
+          echo "::endgroup::"
 
           echo "::group::1. Defconfig & Compile"
           make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
@@ -188,14 +205,12 @@ jobs:
             done < "$VB_LIST"
           fi
 
-          # Copy prebuilt ramdisk/system folder from kernel_kit if it exists
           if [[ -d "$KERNEL_KIT/device/peridot-los23.2/vendor_boot/ramdisk" ]]; then
              cp -r "$KERNEL_KIT/device/peridot-los23.2/vendor_boot/ramdisk/"* "$VB_RAMDISK_DIR/"
           fi
 
           depmod -b "$VB_RAMDISK_DIR" "$UNAME"
           
-          # Generate cpio instead of mkbootfs for Ubuntu compatibility
           (cd "$VB_RAMDISK_DIR" && find . | cpio -o -H newc | gzip -9 > "$DIST/ramdisk.img")
 
           DTB_FILE="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/dtb"
@@ -243,7 +258,7 @@ jobs:
           curl -sL -o dist/nethunter-wireless-firmware.zip "https://github.com/Magisk-Modules-Repo/wirelessFirmware/releases/latest/download/wirelessFirmware.zip" || \
           curl -sL -o dist/nethunter-wireless-firmware.zip "https://github.com/rithvikvibhu/nh-magisk-wifi-firmware/archive/refs/heads/master.zip"
 
-      - name: Upload Build Artifacts
+      - name: Upload Build Artifacts (Workflow Run)
         uses: actions/upload-artifact@v4
         with:
           name: Lucy-SM8635-Packages-${{ github.sha }}
@@ -252,6 +267,48 @@ jobs:
             dist/*.img
             dist/Image-*
           if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: inputs.release_type != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          
+          # Calculate next release tag (e.g., Lucy-peridot-r1)
+          BASE_TAG="Lucy-peridot"
+          LATEST_N=$(gh api "repos/${{ github.repository }}/tags" --paginate --jq '.[].name' \
+            | grep -E "^${BASE_TAG}-r[0-9]+$" \
+            | grep -oE '[0-9]+$' \
+            | sort -n | tail -n1 || true)
+
+          if [ -z "${LATEST_N}" ]; then
+            NEW_TAG="${BASE_TAG}-r0"
+          else
+            NEW_TAG="${BASE_TAG}-r$((LATEST_N + 1))"
+          fi
+
+          echo "Creating release: ${NEW_TAG}"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${NEW_TAG}"
+          git push origin "${NEW_TAG}"
+
+          PRE_FLAG=""
+          if [[ "${{ inputs.release_type }}" == "Pre-release" ]]; then
+            PRE_FLAG="--prerelease"
+          fi
+
+          # Create the release
+          gh release create "${NEW_TAG}" \
+            --repo "${{ github.repository }}" \
+            --title "Lucy Monitor Kernel (${NEW_TAG})" \
+            --notes "Automated build for POCO F6 (peridot). Includes Monitor Mode Wi-Fi support and NetHunter firmware." \
+            ${PRE_FLAG}
+
+          # Upload all build artifacts (zips, imgs) to the release
+          gh release upload "${NEW_TAG}" dist/*.zip dist/*.img --repo "${{ github.repository }}" --clobber
 
       - name: Upload Logs on Failure
         if: failure()
