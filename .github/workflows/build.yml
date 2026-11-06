@@ -220,20 +220,9 @@ jobs:
 
           echo "::group::2. Build system_dlkm & vendor_dlkm"
           
-          # --- ADD AOSP BUILD TOOLS TO PATH ---
-          if [[ -d "$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin" ]]; then
-            export PATH="$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin:$PATH"
-          elif [[ -d "$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux-x86/bin" ]]; then
-            export PATH="$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux-x86/bin:$PATH"
-          fi
-          
-          # Download build_utils.sh for build_image
-          curl -sL https://android.googlesource.com/kernel/build/+/refs/heads/main/build_utils.sh?format=TEXT | base64 -d > "$ROOT/build_utils.sh"
-          source "$ROOT/build_utils.sh"
-
-          # system_dlkm
+          # system_dlkm (Let mke2fs auto-calculate the size needed)
           SYS_STAGE="$OUT/system_dlkm_staging"
-          mkdir -p "$SYS_STAGE/lib/modules/$UNAME"
+          rm -rf "$SYS_STAGE" && mkdir -p "$SYS_STAGE/lib/modules/$UNAME"
           SYS_LIST="$KERNEL_KIT/device/peridot-los23.2/system_dlkm/system_dlkm.modules.include"
           if [[ -f "$SYS_LIST" ]]; then
             while IFS= read -r mod || [[ -n "$mod" ]]; do
@@ -241,28 +230,20 @@ jobs:
               SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
               [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$SYS_STAGE/lib/modules/$UNAME/"
             done < "$SYS_LIST"
+          else
+            echo "WARNING: system_dlkm.modules.include not found, copying all modules."
+            find "$OUT/modules_staging/lib/modules/$UNAME" -name "*.ko" -exec cp {} "$SYS_STAGE/lib/modules/$UNAME/" \;
           fi
           cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$SYS_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
+          
+          # Omit the size argument, mke2fs will use the exact block count required
+          mke2fs -t ext4 -d "$SYS_STAGE" "$DIST/system_dlkm.img"
+          # Omit --partition_size for dynamic partitions
+          avbtool add_hashtree_footer --partition_name system_dlkm --hash_algorithm sha256 --image "$DIST/system_dlkm.img" --do_not_generate_fec
 
-          system_dlkm_props_file="$(mktemp)"
-          if [[ -f "$KERNEL_KIT/device/peridot-los23.2/system_dlkm/system_dlkm.prop" ]]; then
-            cat "$KERNEL_KIT/device/peridot-los23.2/system_dlkm/system_dlkm.prop" > "$system_dlkm_props_file"
-          else
-            echo "system_dlkm_fs_type=ext4" >> "$system_dlkm_props_file"
-            echo "use_dynamic_partition_size=true" >> "$system_dlkm_props_file"
-            echo "ext_mkuserimg=mkuserimg_mke2fs" >> "$system_dlkm_props_file"
-            echo "ext4_share_dup_blocks=true" >> "$system_dlkm_props_file"
-            echo "extfs_rsv_pct=0" >> "$system_dlkm_props_file"
-            echo "journal_size=0" >> "$system_dlkm_props_file"
-          fi
-
-          echo "Building system_dlkm with build_image..."
-          build_image "$SYS_STAGE" "$system_dlkm_props_file" "$DIST/system_dlkm.img" /dev/null
-          avbtool add_hashtree_footer --partition_name system_dlkm --partition_size 7213056 --hash_algorithm sha256 --image "$DIST/system_dlkm.img" --do_not_generate_fec
-
-          # vendor_dlkm
+          # vendor_dlkm (Let mke2fs auto-calculate the size needed)
           VEND_STAGE="$OUT/vendor_dlkm_staging"
-          mkdir -p "$VEND_STAGE/lib/modules/$UNAME"
+          rm -rf "$VEND_STAGE" && mkdir -p "$VEND_STAGE/lib/modules/$UNAME"
           VEND_LIST="$KERNEL_KIT/device/peridot-los23.2/vendor_dlkm/vendor_dlkm.modules.include"
           if [[ -f "$VEND_LIST" ]]; then
             while IFS= read -r mod || [[ -n "$mod" ]]; do
@@ -270,22 +251,16 @@ jobs:
               SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
               [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$VEND_STAGE/lib/modules/$UNAME/"
             done < "$VEND_LIST"
+          else
+            echo "WARNING: vendor_dlkm.modules.include not found, copying all modules."
+            find "$OUT/modules_staging/lib/modules/$UNAME" -name "*.ko" -exec cp {} "$VEND_STAGE/lib/modules/$UNAME/" \;
           fi
           cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$VEND_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
-
-          vendor_dlkm_props_file="$(mktemp)"
-          if [[ -f "$KERNEL_KIT/device/peridot-los23.2/vendor_dlkm/vendor_dlkm.prop" ]]; then
-            cat "$KERNEL_KIT/device/peridot-los23.2/vendor_dlkm/vendor_dlkm.prop" > "$vendor_dlkm_props_file"
-          else
-            echo "vendor_dlkm_fs_type=ext4" >> "$vendor_dlkm_props_file"
-            echo "use_dynamic_partition_size=true" >> "$vendor_dlkm_props_file"
-            echo "ext_mkuserimg=mkuserimg_mke2fs" >> "$vendor_dlkm_props_file"
-            echo "ext4_share_dup_blocks=true" >> "$vendor_dlkm_props_file"
-          fi
-
-          echo "Building vendor_dlkm with build_image..."
-          build_image "$VEND_STAGE" "$vendor_dlkm_props_file" "$DIST/vendor_dlkm.img" /dev/null
-          avbtool add_hashtree_footer --partition_name vendor_dlkm --partition_size 94502912 --hash_algorithm sha256 --image "$DIST/vendor_dlkm.img" --do_not_generate_fec
+          
+          # Omit the size argument
+          mke2fs -t ext4 -d "$VEND_STAGE" "$DIST/vendor_dlkm.img"
+          # Omit --partition_size
+          avbtool add_hashtree_footer --partition_name vendor_dlkm --hash_algorithm sha256 --image "$DIST/vendor_dlkm.img" --do_not_generate_fec
           echo "::endgroup::"
 
           echo "::group::3. OOT WLAN Module Build"
@@ -334,9 +309,7 @@ jobs:
 
           depmod -b "$VB_RAMDISK_DIR" "$UNAME"
           
-          # --- USE MKKBOOTFS (his way) ---
-          echo "Building vendor boot ramdisk with mkbootfs..."
-          (cd "$VB_RAMDISK_DIR" && mkbootfs . | gzip -9 > "$DIST/ramdisk.img")
+          (cd "$VB_RAMDISK_DIR" && find . | cpio -o -H newc | gzip -9 > "$DIST/ramdisk.img")
 
           DTB_FILE="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/dtb"
           BOOTCONFIG="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/bootconfig"
@@ -348,6 +321,7 @@ jobs:
             --vendor_bootconfig "$BOOTCONFIG" \
             --vendor_boot "$DIST/vendor_boot.img"
 
+          # Vendor boot IS a physical partition, so we use the exact size from your JSON (96MB)
           avbtool add_hash_footer --partition_name vendor_boot --partition_size 100663296 --image "$DIST/vendor_boot.img" --algorithm SHA256_RSA4096 --key "$KERNEL_KIT/tools/mkbootimg/gki/testdata/testkey_rsa4096.pem" 2>/dev/null || true
           echo "::endgroup::"
 
