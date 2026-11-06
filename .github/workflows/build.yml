@@ -390,6 +390,11 @@ jobs:
               find "$ROOT/$EXT_MOD_ACTUAL" -type f -name "Kbuild" -exec sed -i 's/-Werror//g' {} + 2>/dev/null || true
               find "$ROOT/$EXT_MOD_ACTUAL" -name "trace_smcinvoke.h" -exec sed -i 's/__stringify(\(.*\))/\1/g' {} + 2>/dev/null || true
               find "$ROOT/$EXT_MOD_ACTUAL" -name "trace_smcinvoke.h" -exec sed -i '1i #include <linux/stringify.h>' {} + 2>/dev/null || true
+              # Point TRACE_INCLUDE_PATH at the real absolute dir (the hardcoded ../../../../sm8635-modules/... path doesn't exist here)
+              find "$ROOT/$EXT_MOD_ACTUAL" -name 'trace_*.h' | while read -r th; do
+                d=$(dirname "$(realpath "$th")")
+                sed -i -E "s|^(#define[[:space:]]+TRACE_INCLUDE_PATH[[:space:]]+).*|\1$d|" "$th"
+              done
             fi
             
             if [[ "$EXT_MOD_ACTUAL" == *"qcacld-3.0"* ]]; then
