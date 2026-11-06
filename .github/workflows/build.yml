@@ -41,10 +41,27 @@ concurrency:
 
 env:
   CACHE_KEY_STATIC: cache-Lucy-peridot-v1
-  OUT_DIR: ${{ github.workspace }}/out
-  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   KERNEL_REPO: ${{ inputs.kernel_repo || 'https://github.com/Harshit-2077/android_kernel_xiaomeme_sm8635.git' }}
   KERNEL_BRANCH: ${{ inputs.kernel_branch || 'lineage-23.2' }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  
+  # Global Paths (Available to all steps)
+  FLAVOR: "Lucy-monitor"
+  ROOT: "${{ github.workspace }}/kernel_src"
+  OUT: "${{ github.workspace }}/out"
+  DIST: "${{ github.workspace }}/dist"
+  DYNAMIC_CACHE_DIR: "${{ github.workspace }}/out/dynamic_cache"
+  KERNEL_KIT: "${{ github.workspace }}/kernel_kit"
+  
+  # Build Variables
+  SOC: "cliffs"
+  CODENAME: "peridot"
+  OS_SHORT: "los23.2"
+  QCACLD_DEV_NAME: "qca6750"
+  TARGET_BOARD_PLATFORM: "cliffs"
+  BOARD_PLATFORM: "cliffs"
+  
+  WARN_FLAGS: "-Wno-error -Wno-gnu-zero-variadic-macro-arguments -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-format"
 
 jobs:
   build:
@@ -100,56 +117,33 @@ jobs:
       - name: Clone Kernel Source & Kernel Kit
         run: |
           echo "Cloning kernel source from $KERNEL_REPO ($KERNEL_BRANCH)..."
-          git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_REPO" "$GITHUB_WORKSPACE/kernel_src"
+          git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_REPO" "$ROOT"
 
           echo "Cloning kernel_kit..."
-          git clone --depth=1 https://github.com/Harshit-2077/kernel_kit.git "$GITHUB_WORKSPACE/kernel_kit"
+          git clone --depth=1 https://github.com/Harshit-2077/kernel_kit.git "$KERNEL_KIT"
           
           echo "Cloning Modules Source..."
           git clone --depth=1 --branch lineage-23.2 "https://github.com/Harshit-2077/android_kernel_xiaomi_sm8635-modules.git" "$GITHUB_WORKSPACE/modules_src"
-
-          echo "KERNEL_KIT=$GITHUB_WORKSPACE/kernel_kit" >> "$GITHUB_ENV"
+          
+          # Create symlink so the directory structure matches standard AOSP expectations for vendor modules
+          ln -sfn "$GITHUB_WORKSPACE/modules_src" "$GITHUB_WORKSPACE/vendor"
 
       - name: Restore Build Cache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ env.OUT_DIR }}
+          path: ${{ env.OUT }}
           key: ${{ env.CACHE_KEY_STATIC }}
 
-      - name: Build Kernel, DLKMs & Images
+      - name: Build Kernel (Image & In-Tree Modules)
         shell: bash
         run: |
           set -euo pipefail
-          FLAVOR="Lucy-monitor"
-          ROOT="$GITHUB_WORKSPACE/kernel_src"
-          OUT="$GITHUB_WORKSPACE/out"
-          DIST="$GITHUB_WORKSPACE/dist"
-          DYNAMIC_CACHE_DIR="$OUT/dynamic_cache"
-          JOBS="$(nproc --all)"
-
-          BUILD_IMAGES="${{ inputs.compile_dlkm }}"
-          if [[ "${{ github.event_name }}" == "push" ]]; then BUILD_IMAGES="true"; fi
-
           mkdir -p "$OUT" "$DIST" "$DYNAMIC_CACHE_DIR"
 
           export PATH="$CLANG_DIR/bin:$PATH"
           export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
           export KBUILD_BUILD_USER="Harshit-2077" KBUILD_BUILD_HOST="Lucy"
-
-          export ROOT_DIR="$ROOT"
-          export KERNEL_DIR="$ROOT"
-          export SOC="cliffs"
-          export CODENAME="peridot"
-          export OS_SHORT="los23.2"
-          export QCACLD_DEV_NAME="qca6750"
-          export DYNAMIC_CACHE_DIR="$DYNAMIC_CACHE_DIR"
           
-          # Crucial for Qualcomm modules to find the right configs
-          export TARGET_BOARD_PLATFORM="${SOC}"
-          export BOARD_PLATFORM="${SOC}"
-
-          WARN_FLAGS="-Wno-error -Wno-gnu-zero-variadic-macro-arguments -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-format"
-
           export CCACHE_DIR="$OUT/ccache"
           mkdir -p "$CCACHE_DIR"
           ccache -o compression=false
@@ -284,7 +278,7 @@ jobs:
             echo "::endgroup::"
           fi
 
-          K_MAKE_FLAGS=("-j$JOBS" "O=$OUT" "ARCH=arm64" "LLVM=1" "LLVM_IAS=1" "CC=ccache clang" "HOSTCC=ccache clang" "HOSTCXX=ccache clang++" "KCFLAGS=$WARN_FLAGS")
+          K_MAKE_FLAGS=("-j$(nproc --all)" "O=$OUT" "ARCH=arm64" "LLVM=1" "LLVM_IAS=1" "CC=ccache clang" "HOSTCC=ccache clang" "HOSTCXX=ccache clang++" "KCFLAGS=$WARN_FLAGS")
           if [[ -v MAKE_FLAGS ]]; then
              K_MAKE_FLAGS=("${MAKE_FLAGS[@]}")
           fi
@@ -299,185 +293,205 @@ jobs:
           UNAME=$(ls lib/modules/)
           depmod -b . "$UNAME"
           cd "$ROOT"
+          
+          # Save UNAME for the next steps
+          echo "UNAME=$UNAME" >> "$GITHUB_ENV"
           echo "::endgroup::"
 
-          if [[ "$BUILD_IMAGES" == "true" ]]; then
-            echo "::group::2. Build system_dlkm & vendor_dlkm (His Way)"
+      - name: Delete Old Build Cache
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh cache delete "${{ env.CACHE_KEY_STATIC }}" || true
 
-            if [[ -d "$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin" ]]; then
-              export PATH="$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin:$PATH"
-            elif [[ -d "$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux-x86/bin" ]]; then
-              export PATH="$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux-x86/bin:$PATH"
-            fi
+      - name: Save New Build Cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.OUT }}
+          key: ${{ env.CACHE_KEY_STATIC }}
 
-            curl -sL https://android.googlesource.com/kernel/build/+/refs/heads/main/build_utils.sh?format=TEXT | base64 -d > "$ROOT/build_utils.sh"
-            source "$ROOT/build_utils.sh"
+      - name: Build DLKMs & External Modules
+        if: ${{ inputs.compile_dlkm == true || github.event_name == 'push' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ROOT"
+          
+          # Re-source build.config to get the EXT_MODULES array into this shell
+          BUILD_CONFIG="$KERNEL_KIT/device/peridot-los23.2/build_config/build.config.peridot.los23.2"
+          set +u
+          source "$BUILD_CONFIG"
+          set -u
 
-            # system_dlkm
-            SYS_STAGE="$OUT/system_dlkm_staging"
-            rm -rf "$SYS_STAGE" && mkdir -p "$SYS_STAGE/lib/modules/$UNAME"
-            SYS_LIST="$KERNEL_KIT/device/peridot-los23.2/system_dlkm/system_dlkm.modules.include"
-            if [[ -f "$SYS_LIST" ]]; then
-              while IFS= read -r mod || [[ -n "$mod" ]]; do
-                [[ -z "$mod" ]] && continue
-                SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
-                [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$SYS_STAGE/lib/modules/$UNAME/"
-              done < "$SYS_LIST"
-            fi
-            cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$SYS_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
-
-            system_dlkm_props_file="$(mktemp)"
-            echo "system_dlkm_fs_type=ext4" >> "$system_dlkm_props_file"
-            echo "use_dynamic_partition_size=true" >> "$system_dlkm_props_file"
-            echo "ext_mkuserimg=mkuserimg_mke2fs" >> "$system_dlkm_props_file"
-            echo "ext4_share_dup_blocks=true" >> "$system_dlkm_props_file"
-            echo "extfs_rsv_pct=0" >> "$system_dlkm_props_file"
-            echo "journal_size=0" >> "$system_dlkm_props_file"
-
-            echo "Building system_dlkm with build_image..."
-            build_image "$SYS_STAGE" "$system_dlkm_props_file" "$DIST/system_dlkm.img" /dev/null
-            avbtool add_hashtree_footer --partition_name system_dlkm --hash_algorithm sha256 --image "$DIST/system_dlkm.img" --do_not_generate_fec
-
-            # vendor_dlkm
-            VEND_STAGE="$OUT/vendor_dlkm_staging"
-            rm -rf "$VEND_STAGE" && mkdir -p "$VEND_STAGE/lib/modules/$UNAME"
-            VEND_LIST="$KERNEL_KIT/device/peridot-los23.2/vendor_dlkm/vendor_dlkm.modules.include"
-            if [[ -f "$VEND_LIST" ]]; then
-              while IFS= read -r mod || [[ -n "$mod" ]]; do
-                [[ -z "$mod" ]] && continue
-                SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
-                [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$VEND_STAGE/lib/modules/$UNAME/"
-              done < "$VEND_LIST"
-            fi
-            cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$VEND_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
-
-            vendor_dlkm_props_file="$(mktemp)"
-            echo "vendor_dlkm_fs_type=ext4" >> "$vendor_dlkm_props_file"
-            echo "use_dynamic_partition_size=true" >> "$vendor_dlkm_props_file"
-            echo "ext_mkuserimg=mkuserimg_mke2fs" >> "$vendor_dlkm_props_file"
-            echo "ext4_share_dup_blocks=true" >> "$vendor_dlkm_props_file"
-
-            echo "Building vendor_dlkm with build_image..."
-            build_image "$VEND_STAGE" "$vendor_dlkm_props_file" "$DIST/vendor_dlkm.img" /dev/null
-            avbtool add_hashtree_footer --partition_name vendor_dlkm --hash_algorithm sha256 --image "$DIST/vendor_dlkm.img" --do_not_generate_fec
-            echo "::endgroup::"
-
-            echo "::group::3. Compile External Modules (Following build.config order)"
-            
-            EXTRA_SYMBOLS=""
-
-            for EXT_MOD in "${EXT_MODULES[@]}"; do
-              # Handle the hidden folder .qca6750 in the build config
-              if [[ "$EXT_MOD" == *"qcacld-3.0"* ]]; then
-                TARGET_DIR="$GITHUB_WORKSPACE/modules_src/qcom/opensource/wlan/qcacld-3.0"
-                EXT_MOD_REL="../../vendor/qcom/opensource/wlan/qcacld-3.0"
-              else
-                CLEAN_PATH="${EXT_MOD#../vendor/}"
-                TARGET_DIR="$GITHUB_WORKSPACE/modules_src/$CLEAN_PATH"
-                EXT_MOD_REL="../../vendor/$CLEAN_PATH"
-              fi
-              
-              if [[ ! -d "$TARGET_DIR" ]]; then
-                echo "WARNING: $TARGET_DIR not found in modules_src, skipping."
-                continue
-              fi
-              
-              echo "Building $TARGET_DIR..."
-              
-              if [[ "$EXT_MOD" == *"qcacld-3.0"* ]]; then
-                echo "Applying monitor mode configs to WLAN..."
-                ln -sfn ../qca-wifi-host-cmn "$TARGET_DIR/cmn"
-                for dcfg in "$TARGET_DIR/configs/"*qca6750* "$TARGET_DIR/configs/default_defconfig"; do
-                  [[ -f "$dcfg" ]] && { sed -i '/CONFIG_FEATURE_MONITOR_MODE_SUPPORT/d' "$dcfg"; echo "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y" >> "$dcfg"; }
-                done
-
-                # Pass ONLY the extra symvers collected so far
-                export KBUILD_EXTRA_SYMBOLS="$EXTRA_SYMBOLS"
-
-                # Notice we use -C "$TARGET_DIR" here to run from the module directory
-                make -j"$JOBS" -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
-                  ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
-                  WLAN_ROOT="$TARGET_DIR" WLAN_COMMON_ROOT=cmn WLAN_COMMON_INC="$TARGET_DIR/cmn" \
-                  WLAN_FW_API="$TARGET_DIR/../fw-api/" CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
-                  CONFIG_CNSS_OUT_OF_TREE=y CONFIG_IPA_OUT_OF_TREE=y CONFIG_QCA_WIFI_ISOC=0 \
-                  CONFIG_QCA_WIFI_2_0=1 WLAN_PROFILE=qca6750 CONFIG_QCA_CLD_WLAN_PROFILE=qca6750 \
-                  CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y DYNAMIC_SINGLE_CHIP=qca6750 DEVNAME=qca6750 \
-                  MODNAME=qca_cld3_qca6750 CONFIG_QCA_CLD_WLAN=m \
-                  KCFLAGS="$WARN_FLAGS -DFEATURE_MONITOR_MODE_SUPPORT -DCONFIG_FEATURE_MONITOR_MODE_SUPPORT=1" \
-                  modules 2>&1 | tee "$OUT/wlan_build.log"
-
-                llvm-strip --strip-debug "$TARGET_DIR/qca_cld3_qca6750.ko"
-              else
-                # Notice we use -C "$TARGET_DIR" here to run from the module directory
-                make -j"$JOBS" -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
-                  ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
-                  CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
-                  KCFLAGS="$WARN_FLAGS" \
-                  modules
-                  
-                make -j"$JOBS" -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
-                  ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
-                  INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_DIR="extra/$CLEAN_PATH" \
-                  modules_install
-              fi
-
-              # Collect the symvers generated by this module for the next ones
-              if [[ -f "$TARGET_DIR/Module.symvers" ]]; then
-                EXTRA_SYMBOLS+=" $TARGET_DIR/Module.symvers"
-              fi
-            done
-            echo "::endgroup::"
-
-            echo "::group::4. Vendor Boot Image (His Way)"
-            VB_RAMDISK_DIR="$OUT/vendor_boot_ramdisk"
-            mkdir -p "$VB_RAMDISK_DIR/lib/modules/$UNAME"
-            
-            WLAN_MOD_PATH="$GITHUB_WORKSPACE/modules_src/qcom/opensource/wlan/qcacld-3.0/qca_cld3_qca6750.ko"
-            if [[ -f "$WLAN_MOD_PATH" ]]; then
-              cp "$WLAN_MOD_PATH" "$VB_RAMDISK_DIR/lib/modules/$UNAME/"
-            fi
-
-            VB_LIST="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/vendor_boot.modules.include"
-            if [[ -f "$VB_LIST" ]]; then
-              while IFS= read -r mod || [[ -n "$mod" ]]; do
-                [[ -z "$mod" ]] && continue
-                SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
-                [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$VB_RAMDISK_DIR/lib/modules/$UNAME/"
-              done < "$VB_LIST"
-            fi
-
-            if [[ -d "$KERNEL_KIT/device/peridot-los23.2/vendor_boot/ramdisk" ]]; then
-               cp -r "$KERNEL_KIT/device/peridot-los23.2/vendor_boot/ramdisk/"* "$VB_RAMDISK_DIR/"
-            fi
-
-            depmod -b "$VB_RAMDISK_DIR" "$UNAME"
-
-            MKBOOTIMG_RAMDISK_CPIO="$DIST/ramdisk.cpio"
-            mkbootfs "$VB_RAMDISK_DIR" > "$MKBOOTIMG_RAMDISK_CPIO"
-            gzip -c -f "$MKBOOTIMG_RAMDISK_CPIO" > "$DIST/ramdisk.gz"
-
-            DTB_FILE="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/dtb"
-            BOOTCONFIG="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/bootconfig"
-
-            mkbootimg --header_version 4 \
-              --vendor_cmdline "bootconfig" \
-              --vendor_ramdisk "$DIST/ramdisk.gz" \
-              --dtb "$DTB_FILE" \
-              --vendor_bootconfig "$BOOTCONFIG" \
-              --vendor_boot "$DIST/vendor_boot.img"
-
-            avbtool add_hash_footer --partition_name vendor_boot --partition_size 100663296 --image "$DIST/vendor_boot.img" --algorithm SHA256_RSA4096 --key "$KERNEL_KIT/tools/mkbootimg/gki/testdata/testkey_rsa4096.pem"
-            echo "::endgroup::"
-          else
-            echo "Skipping DLKMs, External Modules, and Vendor Boot generation (compile_dlkm=false)."
+          echo "::group::2. Build system_dlkm & vendor_dlkm (His Way)"
+          if [[ -d "$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin" ]]; then
+            export PATH="$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin:$PATH"
+          elif [[ -d "$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux-x86/bin" ]]; then
+            export PATH="$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux-x86/bin:$PATH"
           fi
+
+          curl -sL https://android.googlesource.com/kernel/build/+/refs/heads/main/build_utils.sh?format=TEXT | base64 -d > "$ROOT/build_utils.sh"
+          source "$ROOT/build_utils.sh"
+
+          # system_dlkm
+          SYS_STAGE="$OUT/system_dlkm_staging"
+          rm -rf "$SYS_STAGE" && mkdir -p "$SYS_STAGE/lib/modules/$UNAME"
+          SYS_LIST="$KERNEL_KIT/device/peridot-los23.2/system_dlkm/system_dlkm.modules.include"
+          if [[ -f "$SYS_LIST" ]]; then
+            while IFS= read -r mod || [[ -n "$mod" ]]; do
+              [[ -z "$mod" ]] && continue
+              SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
+              [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$SYS_STAGE/lib/modules/$UNAME/"
+            done < "$SYS_LIST"
+          fi
+          cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$SYS_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
+
+          system_dlkm_props_file="$(mktemp)"
+          echo "system_dlkm_fs_type=ext4" >> "$system_dlkm_props_file"
+          echo "use_dynamic_partition_size=true" >> "$system_dlkm_props_file"
+          echo "ext_mkuserimg=mkuserimg_mke2fs" >> "$system_dlkm_props_file"
+          echo "ext4_share_dup_blocks=true" >> "$system_dlkm_props_file"
+          echo "extfs_rsv_pct=0" >> "$system_dlkm_props_file"
+          echo "journal_size=0" >> "$system_dlkm_props_file"
+
+          echo "Building system_dlkm with build_image..."
+          build_image "$SYS_STAGE" "$system_dlkm_props_file" "$DIST/system_dlkm.img" /dev/null
+          avbtool add_hashtree_footer --partition_name system_dlkm --hash_algorithm sha256 --image "$DIST/system_dlkm.img" --do_not_generate_fec
+
+          # vendor_dlkm
+          VEND_STAGE="$OUT/vendor_dlkm_staging"
+          rm -rf "$VEND_STAGE" && mkdir -p "$VEND_STAGE/lib/modules/$UNAME"
+          VEND_LIST="$KERNEL_KIT/device/peridot-los23.2/vendor_dlkm/vendor_dlkm.modules.include"
+          if [[ -f "$VEND_LIST" ]]; then
+            while IFS= read -r mod || [[ -n "$mod" ]]; do
+              [[ -z "$mod" ]] && continue
+              SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
+              [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$VEND_STAGE/lib/modules/$UNAME/"
+            done < "$VEND_LIST"
+          fi
+          cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$VEND_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
+
+          vendor_dlkm_props_file="$(mktemp)"
+          echo "vendor_dlkm_fs_type=ext4" >> "$vendor_dlkm_props_file"
+          echo "use_dynamic_partition_size=true" >> "$vendor_dlkm_props_file"
+          echo "ext_mkuserimg=mkuserimg_mke2fs" >> "$vendor_dlkm_props_file"
+          echo "ext4_share_dup_blocks=true" >> "$vendor_dlkm_props_file"
+
+          echo "Building vendor_dlkm with build_image..."
+          build_image "$VEND_STAGE" "$vendor_dlkm_props_file" "$DIST/vendor_dlkm.img" /dev/null
+          avbtool add_hashtree_footer --partition_name vendor_dlkm --hash_algorithm sha256 --image "$DIST/vendor_dlkm.img" --do_not_generate_fec
+          echo "::endgroup::"
+
+          echo "::group::3. Compile External Modules (Following build.config order)"
+          
+          EXTRA_SYMBOLS=""
+
+          for EXT_MOD in "${EXT_MODULES[@]}"; do
+            EXT_MOD_ACTUAL=$(echo "$EXT_MOD" | sed "s/\.\${QCACLD_DEV_NAME}/.qca6750/")
+            
+            if [[ ! -d "$ROOT/$EXT_MOD_ACTUAL" ]]; then
+              echo "WARNING: The following module path does not exist : $EXT_MOD_ACTUAL" >&2
+              continue
+            fi
+            
+            echo "Building $EXT_MOD_ACTUAL..."
+            
+            if [[ "$EXT_MOD_ACTUAL" == *"qcacld-3.0"* ]]; then
+              TARGET_DIR="$ROOT/$EXT_MOD_ACTUAL"
+              echo "Applying monitor mode configs to WLAN..."
+              ln -sfn ../qca-wifi-host-cmn "$TARGET_DIR/cmn"
+              for dcfg in "$TARGET_DIR/configs/"*qca6750* "$TARGET_DIR/configs/default_defconfig"; do
+                [[ -f "$dcfg" ]] && { sed -i '/CONFIG_FEATURE_MONITOR_MODE_SUPPORT/d' "$dcfg"; echo "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y" >> "$dcfg"; }
+              done
+
+              export KBUILD_EXTRA_SYMBOLS="$EXTRA_SYMBOLS"
+
+              make -j$(nproc --all) -C "$ROOT" O="$OUT" M="$EXT_MOD_ACTUAL" \
+                ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
+                WLAN_ROOT="$TARGET_DIR" WLAN_COMMON_ROOT=cmn WLAN_COMMON_INC="$TARGET_DIR/cmn" \
+                WLAN_FW_API="$TARGET_DIR/../fw-api/" CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
+                CONFIG_CNSS_OUT_OF_TREE=y CONFIG_IPA_OUT_OF_TREE=y CONFIG_QCA_WIFI_ISOC=0 \
+                CONFIG_QCA_WIFI_2_0=1 WLAN_PROFILE=qca6750 CONFIG_QCA_CLD_WLAN_PROFILE=qca6750 \
+                CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y DYNAMIC_SINGLE_CHIP=qca6750 DEVNAME=qca6750 \
+                MODNAME=qca_cld3_qca6750 CONFIG_QCA_CLD_WLAN=m \
+                KCFLAGS="$WARN_FLAGS -DFEATURE_MONITOR_MODE_SUPPORT -DCONFIG_FEATURE_MONITOR_MODE_SUPPORT=1" \
+                modules 2>&1 | tee "$OUT/wlan_build.log"
+
+              llvm-strip --strip-debug "$TARGET_DIR/qca_cld3_qca6750.ko"
+            else
+              CLEAN_PATH=$(echo "$EXT_MOD_ACTUAL" | sed 's|^\.\./vendor/||')
+              
+              make -j$(nproc --all) -C "$ROOT" O="$OUT" M="$EXT_MOD_ACTUAL" \
+                ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
+                CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
+                KCFLAGS="$WARN_FLAGS" \
+                modules
+                
+              make -j$(nproc --all) -C "$ROOT" O="$OUT" M="$EXT_MOD_ACTUAL" \
+                ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
+                INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_DIR="extra/$CLEAN_PATH" \
+                modules_install
+            fi
+
+            if [[ -f "$ROOT/$EXT_MOD_ACTUAL/Module.symvers" ]]; then
+              EXTRA_SYMBOLS+=" $ROOT/$EXT_MOD_ACTUAL/Module.symvers"
+            fi
+          done
+          echo "::endgroup::"
+
+          echo "::group::4. Vendor Boot Image (His Way)"
+          VB_RAMDISK_DIR="$OUT/vendor_boot_ramdisk"
+          mkdir -p "$VB_RAMDISK_DIR/lib/modules/$UNAME"
+          
+          WLAN_MOD_PATH="$ROOT/../vendor/qcom/opensource/wlan/qcacld-3.0/qca_cld3_qca6750.ko"
+          if [[ -f "$WLAN_MOD_PATH" ]]; then
+            cp "$WLAN_MOD_PATH" "$VB_RAMDISK_DIR/lib/modules/$UNAME/"
+          fi
+
+          VB_LIST="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/vendor_boot.modules.include"
+          if [[ -f "$VB_LIST" ]]; then
+            while IFS= read -r mod || [[ -n "$mod" ]]; do
+              [[ -z "$mod" ]] && continue
+              SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
+              [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$VB_RAMDISK_DIR/lib/modules/$UNAME/"
+            done < "$VB_LIST"
+          fi
+
+          if [[ -d "$KERNEL_KIT/device/peridot-los23.2/vendor_boot/ramdisk" ]]; then
+             cp -r "$KERNEL_KIT/device/peridot-los23.2/vendor_boot/ramdisk/"* "$VB_RAMDISK_DIR/"
+          fi
+
+          depmod -b "$VB_RAMDISK_DIR" "$UNAME"
+
+          MKBOOTIMG_RAMDISK_CPIO="$DIST/ramdisk.cpio"
+          mkbootfs "$VB_RAMDISK_DIR" > "$MKBOOTIMG_RAMDISK_CPIO"
+          gzip -c -f "$MKBOOTIMG_RAMDISK_CPIO" > "$DIST/ramdisk.gz"
+
+          DTB_FILE="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/dtb"
+          BOOTCONFIG="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/bootconfig"
+
+          mkbootimg --header_version 4 \
+            --vendor_cmdline "bootconfig" \
+            --vendor_ramdisk "$DIST/ramdisk.gz" \
+            --dtb "$DTB_FILE" \
+            --vendor_bootconfig "$BOOTCONFIG" \
+            --vendor_boot "$DIST/vendor_boot.img"
+
+          avbtool add_hash_footer --partition_name vendor_boot --partition_size 100663296 --image "$DIST/vendor_boot.img" --algorithm SHA256_RSA4096 --key "$KERNEL_KIT/tools/mkbootimg/gki/testdata/testkey_rsa4096.pem"
+          echo "::endgroup::"
+
+      - name: Package AnyKernel3
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ROOT"
 
           echo "::group::5. Packaging Artifacts"
           STAGE="$(mktemp -d)"
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$STAGE"
           rm -rf "$STAGE/.git"
 
-          # Safely write anykernel.sh without YAML heredoc issues
           echo '#!/sbin/sh' > "$STAGE/anykernel.sh"
           echo 'properties() { ' >> "$STAGE/anykernel.sh"
           echo 'kernel.string=Lucy-Monitor' >> "$STAGE/anykernel.sh"
@@ -517,7 +531,7 @@ jobs:
 
           cp -f "$OUT/arch/arm64/boot/Image" "$STAGE/Image"
           
-          WLAN_MOD_PATH="$GITHUB_WORKSPACE/modules_src/qcom/opensource/wlan/qcacld-3.0/qca_cld3_qca6750.ko"
+          WLAN_MOD_PATH="$ROOT/../vendor/qcom/opensource/wlan/qcacld-3.0/qca_cld3_qca6750.ko"
           if [[ -f "$WLAN_MOD_PATH" ]]; then
             cp -f "$WLAN_MOD_PATH" "$STAGE/"
           fi
@@ -531,19 +545,6 @@ jobs:
           mkdir -p dist
           curl -sL -o dist/nethunter-wireless-firmware.zip "https://github.com/Magisk-Modules-Repo/wirelessFirmware/releases/latest/download/wirelessFirmware.zip" || \
           curl -sL -o dist/nethunter-wireless-firmware.zip "https://github.com/rithvikvibhu/nh-magisk-wifi-firmware/archive/refs/heads/master.zip"
-
-      - name: Delete Old Build Cache
-        if: success()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh cache delete "${{ env.CACHE_KEY_STATIC }}" || true
-
-      - name: Save New Build Cache
-        if: success()
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ env.OUT_DIR }}
-          key: ${{ env.CACHE_KEY_STATIC }}
 
       - name: Upload Build Artifacts (Workflow Run)
         uses: actions/upload-artifact@v4
