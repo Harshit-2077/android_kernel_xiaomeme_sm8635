@@ -1,49 +1,59 @@
-name: Build Lucy Kernel & Monitor Wi-Fi
+name: Build Lucy Kernel, DLKMs & Monitor Wi-Fi
 
 on:
   push:
     branches: [ "main", "master" ]
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'dist/**']
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
-      - name: Maximize Build Space & Add 8GB Swap
+      - name: Maximize Build Space & Add Swap
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo fallocate -l 8G /swapfile_extra
+          sudo dd if=/dev/zero of=/swapfile_extra bs=1M count=8192 status=progress
           sudo chmod 600 /swapfile_extra
           sudo mkswap /swapfile_extra
           sudo swapon /swapfile_extra
           free -h
-          df -h
 
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Install Build Dependencies
+      - name: Install Build Dependencies & Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             bc bison build-essential ccache curl file flex git libelf-dev \
             libncurses-dev libssl-dev lld llvm pahole patch patchelf \
-            python3 rsync unzip wget zip zstd \
-            mkbootimg android-sdk-libsparse-utils
+            python3 rsync unzip wget zip zstd device-tree-compiler \
+            android-sdk-libsparse-utils mkbootimg
+
+          curl -sL https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT | base64 -d | sudo tee /usr/local/bin/avbtool > /dev/null
+          sudo chmod +x /usr/local/bin/avbtool
+
+          curl -sL https://android.googlesource.com/kernel/build/+/refs/heads/main/build_utils.sh?format=TEXT | base64 -d > build_utils.sh
+          chmod +x build_utils.sh
 
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: Lucy-sm8635-ccache
+          key: Lucy-sm8635-ccache-v1
           max-size: 2G
 
-      - name: Setup Neutron Clang Toolchain (with glibc 2.39 patch)
+      - name: Setup Neutron Clang Toolchain
         run: |
           mkdir -p "$HOME/clang"
           cd "$HOME/clang"
@@ -53,187 +63,100 @@ jobs:
           ./antman --patch=glibc
           echo "CLANG_DIR=$HOME/clang" >> "$GITHUB_ENV"
 
-      - name: Unified Build (Kernel + WLAN Module + Flashable ZIPs)
+      - name: Fetch Kernel Kit (Device Files & Scripts)
+        run: |
+          git clone --depth=1 https://github.com/Harshit-2077/kernel_kit.git "$GITHUB_WORKSPACE/kernel_kit"
+          export KERNEL_KIT="$GITHUB_WORKSPACE/kernel_kit"
+          echo "KERNEL_KIT=$KERNEL_KIT" >> "$GITHUB_ENV"
+
+      - name: Build Kernel & DLKMs
         shell: bash
         run: |
           set -euo pipefail
-
           FLAVOR="Lucy-monitor"
           ROOT="$GITHUB_WORKSPACE"
           cd "$ROOT"
 
-          PATCHED_MODULES_REPO="https://github.com/Harshit-2077/android_kernel_xiaomi_sm8635-modules.git"
-          ANYKERNEL_REPO="https://github.com/osm0sis/AnyKernel3.git"
-
           export PATH="$CLANG_DIR/bin:$PATH"
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export LLVM=1
-          export LLVM_IAS=1
-          export KBUILD_BUILD_USER="Harshit-2077"
-          export KBUILD_BUILD_HOST="Lucy"
+          export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
+          export KBUILD_BUILD_USER="Harshit-2077" KBUILD_BUILD_HOST="Lucy"
 
-          OUT="$ROOT/out"
-          DIST="$ROOT/dist"
-          JOBS="$(nproc --all)"
-          ZIP_PREFIX="Lucy-Monitor"
-          ZIP_VERSION="v1.0"
-
+          OUT="$ROOT/out"; DIST="$ROOT/dist"; JOBS="$(nproc --all)"
+          rm -rf "$OUT" "$DIST"; mkdir -p "$OUT" "$DIST"
           WARN_FLAGS="-Wno-error -Wno-gnu-zero-variadic-macro-arguments -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-format"
 
-          log() {
-            printf '\033[1;34m[%s]\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*"
-          }
-
-          log "Toolchain: $(clang --version | head -n 1)"
-          log "Kernel Source: $(head -n 4 "$ROOT/Makefile" | tr '\n' ' ')"
-
-          # 1. Fix OpenSSL 3.0 undeclared 'key_pass' on Ubuntu 24.04 runners
-          if [[ -f "$ROOT/certs/extract-cert.c" ]]; then
-            sed -i '/static.*key_pass/d' "$ROOT/certs/extract-cert.c"
-            sed -i '1i __attribute__((unused)) static const char *key_pass;' "$ROOT/certs/extract-cert.c"
-          fi
-
-          rm -rf "$OUT" "$DIST"
-          mkdir -p "$OUT" "$DIST"
-
-          # 2. Generate Base Defconfig
-          log "Generating base gki_defconfig..."
+          # 1. Defconfig & Feature Enabling
           make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
-
-          for frag in \
-            "$ROOT/arch/arm64/configs/vendor/pineapple_GKI.config" \
-            "$ROOT/arch/arm64/configs/vendor/peridot_GKI.config" \
-            "$ROOT/arch/arm64/configs/peridot_GKI.config"; do
-            if [[ -f "$frag" ]]; then
-              log "Merging fragment: $frag"
-              ARCH=arm64 "$ROOT/scripts/kconfig/merge_config.sh" -m -O "$OUT" "$OUT/.config" "$frag"
-            fi
+          for frag in arch/arm64/configs/vendor/pineapple_GKI.config \
+                      arch/arm64/configs/vendor/peridot_GKI.config; do
+            [[ -f "$frag" ]] && ARCH=arm64 scripts/kconfig/merge_config.sh -m -O "$OUT" "$OUT/.config" "$frag"
           done
 
-          log "config + ThinLTO + Wireless dependencies..."
           ./scripts/config --file "$OUT/.config" \
-            --set-str LOCALVERSION "-Lucy-Monitor" \
-            -d LOCALVERSION_AUTO \
-            -d WERROR \
-            --set-val UCLAMP_BUCKETS_COUNT 20 \
-            -d TASK_DELAY_ACCT \
-            -d RSEQ \
-            -d SCHED_CLUSTER \
-            -e SCHED_MC \
-            -e SCHED_HRTICK \
-            -e RT_SOFTIRQ_AWARE_SCHED \
-            -e RCU_BOOST \
-            -e RCU_LAZY \
-            -e RCU_LAZY_DEFAULT_OFF \
-            -e BOEFFLA_WL_BLOCKER \
-            -e UNWIND_TABLES \
-            -e UNWIND_PATCH_PAC_INTO_SCS \
-            -e DYNAMIC_SCS \
-            -d HZ_100 \
-            -e HZ_250 \
-            -d HZ_300 \
-            -d HZ_1000 \
-            --set-val HZ 250 \
-            -d LTO_NONE \
-            -d LTO_CLANG_FULL \
-            -e LTO \
-            -e LTO_CLANG \
-            -e LTO_CLANG_THIN \
-            -e CFI_CLANG \
-            -d MODULE_SIG \
-            -d MODULE_SIG_FORCE \
-            -d MODULE_SIG_ALL \
-            -m MI_HARDWARE_ID \
-            -m RFKILL \
-            -m CFG80211 \
-            -e NL80211_TESTMODE \
-            -e CFG80211_REQUIRE_SIGNED_REGDB \
-            -e CFG80211_USE_KERNEL_REGDB_KEYS \
-            -e CFG80211_DEFAULT_PS \
-            -d CFG80211_CRDA_SUPPORT \
-            -d CFG80211_WEXT \
-            -m MAC80211
-
+            --set-str LOCALVERSION "-Lucy-Monitor" -d LOCALVERSION_AUTO -d WERROR \
+            --set-val UCLAMP_BUCKETS_COUNT 20 -d TASK_DELAY_ACCT -d RSEQ -d SCHED_CLUSTER \
+            -e SCHED_MC -e SCHED_HRTICK -e RT_SOFTIRQ_AWARE_SCHED -e RCU_BOOST -e RCU_LAZY \
+            -e RCU_LAZY_DEFAULT_OFF -e BOEFFLA_WL_BLOCKER -e UNWIND_TABLES -e UNWIND_PATCH_PAC_INTO_SCS \
+            -e DYNAMIC_SCS -d HZ_100 -e HZ_250 -d HZ_300 -d HZ_1000 --set-val HZ 250 \
+            -d LTO_NONE -d LTO_CLANG_FULL -e LTO_CLANG -e LTO_CLANG_THIN -e CFI_CLANG \
+            -d MODULE_SIG -d MODULE_SIG_FORCE -d MODULE_SIG_ALL \
+            -m MI_HARDWARE_ID -m RFKILL -m CFG80211 -e NL80211_TESTMODE \
+            -e CFG80211_REQUIRE_SIGNED_REGDB -e CFG80211_USE_KERNEL_REGDB_KEYS \
+            -e CFG80211_DEFAULT_PS -d CFG80211_CRDA_SUPPORT -d CFG80211_WEXT -m MAC80211
           make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
-          # 3. Build Kernel Image & In-Tree Modules
-          log "Building Kernel Image & Modules (jobs=$JOBS)..."
-          if ! make -j"$JOBS" O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+          # 2. Build Kernel Image and in-tree modules
+          make -j"$JOBS" O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
-            KBUILD_MODPOST_WARN=1 \
-            KCFLAGS="$WARN_FLAGS" \
-            Image modules 2>&1 | tee "$OUT/build.log"; then
-            echo "::error::Kernel build failed! Printing compiler/linker errors from build.log:"
-            grep -n -C 5 -E "(error:|fatal error:|undefined symbol|ld\.lld: error:)" "$OUT/build.log" || true
-            exit 1
-          fi
+            KBUILD_MODPOST_WARN=1 KCFLAGS="$WARN_FLAGS" \
+            Image modules
 
-          IMG="$OUT/arch/arm64/boot/Image"
-          if [[ ! -f "$IMG" ]]; then
-            echo "::error::Kernel Image was not produced at $IMG"
-            exit 1
-          fi
-
-          cp -f "$IMG" "$DIST/Image-$FLAVOR"
-          cp -f "$OUT/Module.symvers" "$DIST/Module.symvers-$FLAVOR"
+          cp -f "$OUT/arch/arm64/boot/Image" "$DIST/Image-$FLAVOR"
           cp -f "$OUT/.config" "$DIST/config-$FLAVOR"
 
-          # 4. Build DTB + DTBO
-          log "Building device tree blobs (dtbs)..."
-          if ! make -j"$JOBS" O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
-            dtbs 2>&1 | tee "$OUT/dtbs_build.log"; then
-            echo "::error::DTB build failed! Printing errors from dtbs_build.log:"
-            grep -n -C 5 -E "(error:|fatal error:|Error:|Syntax error)" "$OUT/dtbs_build.log" || true
-            exit 1
-          fi
+          make -j"$JOBS" O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_STRIP=1 modules_install
+          cd "$OUT/modules_staging"
+          UNAME=$(ls lib/modules/)
+          depmod -b . "$UNAME"
 
-          DTB_OUT_DIR="$OUT/arch/arm64/boot/dts"
-
-          # Ensure mkdtimg is available (apt mkbootimg usually ships it on 24.04;
-          # otherwise build from AOSP libufdt as a fallback).
-          if ! command -v mkdtimg >/dev/null 2>&1; then
-            log "mkdtimg not in PATH; building from AOSP libufdt source..."
-            rm -rf "$ROOT/libufdt_src"
-            if git clone --depth=1 https://android.googlesource.com/platform/system/libufdt "$ROOT/libufdt_src"; then
-              (cd "$ROOT/libufdt_src" && make -j"$JOBS" utils 2>/dev/null || true)
-              MKDTIMG_BIN=$(find "$ROOT/libufdt_src" -type f -name mkdtimg -perm -u+x | head -n1)
-              if [[ -n "${MKDTIMG_BIN:-}" ]]; then
-                export PATH="$(dirname "$MKDTIMG_BIN"):$PATH"
-                log "Built mkdtimg at $MKDTIMG_BIN"
-              fi
-            fi
-          fi
-
-          mapfile -d '' DTBO_ARRAY < <(find "$DTB_OUT_DIR" -type f -name '*.dtbo' -print0 2>/dev/null || true)
-
-          if [[ ${#DTBO_ARRAY[@]} -gt 0 ]]; then
-            if command -v mkdtimg >/dev/null 2>&1; then
-              DTBO_IMG="$DIST/dtbo-$FLAVOR.img"
-              log "Packaging dtbo.img from ${#DTBO_ARRAY[@]} overlay(s)..."
-              if mkdtimg create "$DTBO_IMG" "${DTBO_ARRAY[@]}" 2>&1 | tee "$OUT/mkdtimg.log"; then
-                log "Packaged dtbo.img: $DTBO_IMG ($(du -h "$DTBO_IMG" | cut -f1))"
-              else
-                echo "::warning::mkdtimg failed; see $OUT/mkdtimg.log"
-              fi
-            else
-              echo "::warning::mkdtimg unavailable; dtbo.img NOT generated (${#DTBO_ARRAY[@]} .dtbo files exist)"
-            fi
+          # 3. Build Dynamic Kernel Modules (DLKMs) using kernel_kit device files
+          # system_dlkm
+          SYS_STAGE="$OUT/system_dlkm_staging"
+          mkdir -p "$SYS_STAGE/lib/modules/$UNAME"
+          SYS_LIST="$KERNEL_KIT/device/peridot-los23.2/system_dlkm/system_dlkm.modules.include"
+          if [[ -f "$SYS_LIST" ]]; then
+            while IFS= read -r mod; do
+              [[ -z "$mod" ]] && continue
+              find lib/modules/$UNAME -name "$mod" -exec cp {} "$SYS_STAGE/lib/modules/$UNAME/" \;
+            done < "$SYS_LIST"
           else
-            echo "::warning::No .dtbo files under $DTB_OUT_DIR; dtbo.img skipped"
+            echo "WARNING: system_dlkm.modules.include not found, copying all modules"
+            find lib/modules/$UNAME -name "*.ko" -exec cp {} "$SYS_STAGE/lib/modules/$UNAME/" \;
           fi
+          cp lib/modules/$UNAME/modules.{alias,dep,softdep} "$SYS_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
+          bash "$ROOT/build_utils.sh" build_image "$SYS_STAGE" "" "$DIST/system_dlkm.img" /dev/null 2>/dev/null || \
+            make_ext4fs -s -l 64M -a system_dlkm "$DIST/system_dlkm.img" "$SYS_STAGE"
+          avbtool add_hashtree_footer --partition_name system_dlkm --hash_algorithm sha256 --image "$DIST/system_dlkm.img" --do_not_generate_fec
 
-          # Also export raw .dtb files for reference
-          mkdir -p "$DIST/dtb-$FLAVOR"
-          mapfile -d '' DTB_ARRAY < <(find "$DTB_OUT_DIR" -type f -name '*.dtb' -print0 2>/dev/null || true)
-          if [[ ${#DTB_ARRAY[@]} -gt 0 ]]; then
-            cp -f "${DTB_ARRAY[@]}" "$DIST/dtb-$FLAVOR/"
-            log "Copied ${#DTB_ARRAY[@]} raw .dtb file(s) to dist/dtb-$FLAVOR/"
+          # vendor_dlkm
+          VEND_STAGE="$OUT/vendor_dlkm_staging"
+          mkdir -p "$VEND_STAGE/lib/modules/$UNAME"
+          VEND_LIST="$KERNEL_KIT/device/peridot-los23.2/vendor_dlkm/vendor_dlkm.modules.include"
+          if [[ -f "$VEND_LIST" ]]; then
+            while IFS= read -r mod; do
+              [[ -z "$mod" ]] && continue
+              find lib/modules/$UNAME -name "$mod" -exec cp {} "$VEND_STAGE/lib/modules/$UNAME/" \;
+            done < "$VEND_LIST"
+          else
+            find lib/modules/$UNAME -name "*.ko" -exec cp {} "$VEND_STAGE/lib/modules/$UNAME/" \;
           fi
+          cp lib/modules/$UNAME/modules.{alias,dep,softdep} "$VEND_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
+          bash "$ROOT/build_utils.sh" build_image "$VEND_STAGE" "" "$DIST/vendor_dlkm.img" /dev/null 2>/dev/null || \
+            make_ext4fs -s -l 64M -a vendor_dlkm "$DIST/vendor_dlkm.img" "$VEND_STAGE"
+          avbtool add_hashtree_footer --partition_name vendor_dlkm --hash_algorithm sha256 --image "$DIST/vendor_dlkm.img" --do_not_generate_fec
 
-          # 5. Clone modules repo (pinned to the branch carrying our monitor-mode fix)
-          log "Cloning SM8635 modules from $PATCHED_MODULES_REPO (branch lineage-23.2)..."
+          # 4. Out-of-Tree (OOT) WLAN Module Build
+          PATCHED_MODULES_REPO="https://github.com/Harshit-2077/android_kernel_xiaomi_sm8635-modules.git"
           rm -rf "$ROOT/modules_src"
           git clone --depth=1 --branch lineage-23.2 "$PATCHED_MODULES_REPO" "$ROOT/modules_src"
 
@@ -241,309 +164,95 @@ jobs:
           QCACLD_DIR="$WLAN_DIR/qcacld-3.0"
           ln -sfn ../qca-wifi-host-cmn "$QCACLD_DIR/cmn"
 
-          # Ensure qca6750_defconfig & default_defconfig enable monitor mode support
           for dcfg in "$QCACLD_DIR/configs/"*qca6750* "$QCACLD_DIR/configs/default_defconfig"; do
-            if [[ -f "$dcfg" ]]; then
-              sed -i '/CONFIG_FEATURE_MONITOR_MODE_SUPPORT/d' "$dcfg"
-              echo "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y" >> "$dcfg"
-            fi
+            [[ -f "$dcfg" ]] && { sed -i '/CONFIG_FEATURE_MONITOR_MODE_SUPPORT/d' "$dcfg"; echo "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y" >> "$dcfg"; }
           done
 
-          # Append 43 vendor_dlkm symbol CRCs so out-of-tree modpost succeeds
-          python3 - "$OUT/Module.symvers" << 'PYEOF'
-          import sys
+          export KBUILD_EXTRA_SYMBOLS="$OUT/Module.symvers"
 
-          symvers_path = sys.argv[1]
-          lines = open(symvers_path, "r", encoding="utf-8", errors="ignore").read().splitlines()
-          sample = lines[0] if lines else "0x00000000\tdummy\tvmlinux\tEXPORT_SYMBOL\t"
-          num_tabs = sample.count("\t")
-
-          vendor_syms = [
-              ("0xf35b1593", "__icnss_register_driver"),
-              ("0x62f5d9f4", "cld80211_get_genl_family"),
-              ("0x7f3db83b", "cnss_utils_get_wlan_derived_mac_address"),
-              ("0xdd04312a", "cnss_utils_get_wlan_mac_address"),
-              ("0x7cab32df", "cnss_utils_get_wlan_unsafe_channel"),
-              ("0x0e39f21c", "cnss_utils_increment_driver_load_cnt"),
-              ("0x83d6fb88", "cnss_utils_set_wlan_unsafe_channel"),
-              ("0xef048766", "cnss_utils_wlan_get_dfs_nol"),
-              ("0xb83d7182", "cnss_utils_wlan_set_dfs_nol"),
-              ("0x1a4d338d", "deregister_cld_cmd_cb"),
-              ("0xd42566f2", "icnss_allow_l1"),
-              ("0x8831b37b", "icnss_athdiag_read"),
-              ("0xaabf5c45", "icnss_athdiag_write"),
-              ("0x61e3742e", "icnss_exit_power_save"),
-              ("0xe32d9f2a", "icnss_force_wake_release"),
-              ("0x0f936194", "icnss_force_wake_request"),
-              ("0xc7db251a", "icnss_get_curr_therm_cdev_state"),
-              ("0x71358fe3", "icnss_get_mhi_state"),
-              ("0xd9cebef2", "icnss_get_msi_address"),
-              ("0x22af7d88", "icnss_get_msi_irq"),
-              ("0xf7f0c22c", "icnss_get_soc_info"),
-              ("0xa8b17f5a", "icnss_get_user_msi_assignment"),
-              ("0x71e6e153", "icnss_idle_restart"),
-              ("0x413458df", "icnss_idle_shutdown"),
-              ("0x354028de", "icnss_is_device_awake"),
-              ("0x9b5bd3f7", "icnss_is_fw_down"),
-              ("0xbadde3d4", "icnss_is_pci_ep_awake"),
-              ("0x49e4b3b1", "icnss_power_off"),
-              ("0x8f973526", "icnss_power_on"),
-              ("0xa35f4a41", "icnss_prevent_l1"),
-              ("0x6a21d2a9", "icnss_qmi_send"),
-              ("0xb8aa15ba", "icnss_set_fw_log_mode"),
-              ("0x46d9e785", "icnss_smmu_get_domain"),
-              ("0x3c92e266", "icnss_smmu_map"),
-              ("0xb71bf2a4", "icnss_thermal_cdev_register"),
-              ("0x188e10cc", "icnss_thermal_cdev_unregister"),
-              ("0x835eac09", "icnss_trigger_recovery"),
-              ("0x07cf14dc", "icnss_unregister_driver"),
-              ("0x254b144e", "icnss_wlan_disable"),
-              ("0x10b1edcc", "icnss_wlan_enable"),
-              ("0x14d2e4b6", "register_cld_cmd_cb"),
-              ("0xdff15e8a", "wcnss_prealloc_get"),
-              ("0x0521fc53", "wcnss_prealloc_put"),
-          ]
-
-          existing = {l.split("\t")[1] for l in lines if "\t" in l}
-          with open(symvers_path, "a", encoding="utf-8") as f:
-              for crc, name in vendor_syms:
-                  if name not in existing:
-                      extra_tabs = "\t" * max(0, num_tabs - 3)
-                      f.write(f"{crc}\t{name}\tvmlinux\tEXPORT_SYMBOL{extra_tabs}\n")
-          print(f"[+] Appended {len(vendor_syms)} vendor symbols")
-          PYEOF
-
-          if ! make -j"$JOBS" -C "$ROOT" O="$OUT" \
+          make -j"$JOBS" -C "$ROOT" O="$OUT" \
             M="$QCACLD_DIR" \
             CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
-            WLAN_ROOT="$QCACLD_DIR" \
-            WLAN_COMMON_ROOT=cmn \
-            WLAN_COMMON_INC="$QCACLD_DIR/cmn" \
-            WLAN_FW_API="$WLAN_DIR/fw-api/" \
-            CONFIG_ARCH_PINEAPPLE=y \
-            CONFIG_ARCH_QCOM=y \
-            CONFIG_CNSS_OUT_OF_TREE=y \
-            CONFIG_IPA_OUT_OF_TREE=y \
-            CONFIG_QCA_WIFI_ISOC=0 \
-            CONFIG_QCA_WIFI_2_0=1 \
-            WLAN_PROFILE=qca6750 \
-            CONFIG_QCA_CLD_WLAN_PROFILE=qca6750 \
-            CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y \
-            DYNAMIC_SINGLE_CHIP=qca6750 \
-            DEVNAME=qca6750 \
-            MODNAME=qca_cld3_qca6750 \
-            CONFIG_QCA_CLD_WLAN=m \
-            KBUILD_MODPOST_WARN=1 \
+            WLAN_ROOT="$QCACLD_DIR" WLAN_COMMON_ROOT=cmn WLAN_COMMON_INC="$QCACLD_DIR/cmn" \
+            WLAN_FW_API="$WLAN_DIR/fw-api/" CONFIG_ARCH_PINEAPPLE=y CONFIG_ARCH_QCOM=y \
+            CONFIG_CNSS_OUT_OF_TREE=y CONFIG_IPA_OUT_OF_TREE=y CONFIG_QCA_WIFI_ISOC=0 \
+            CONFIG_QCA_WIFI_2_0=1 WLAN_PROFILE=qca6750 CONFIG_QCA_CLD_WLAN_PROFILE=qca6750 \
+            CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y DYNAMIC_SINGLE_CHIP=qca6750 DEVNAME=qca6750 \
+            MODNAME=qca_cld3_qca6750 CONFIG_QCA_CLD_WLAN=m \
             KCFLAGS="$WARN_FLAGS -DFEATURE_MONITOR_MODE_SUPPORT -DCONFIG_FEATURE_MONITOR_MODE_SUPPORT=1" \
-            modules 2>&1 | tee "$OUT/wlan_build.log"; then
-            echo "::error::WLAN module build failed! Printing errors from wlan_build.log:"
-            grep -n -C 5 -E "(error:|fatal error:|undefined symbol|ld\.lld: error:|Stop\.)" "$OUT/wlan_build.log" || true
-            exit 1
-          fi
+            modules 2>&1 | tee "$OUT/wlan_build.log"
 
           llvm-strip --strip-debug "$QCACLD_DIR/qca_cld3_qca6750.ko"
 
-          # 6. Package Unified AnyKernel3 Zip
+          # 5. Vendor Boot Image Construction using kernel_kit
+          VB_RAMDISK_DIR="$OUT/vendor_boot_ramdisk"
+          mkdir -p "$VB_RAMDISK_DIR/lib/modules/$UNAME"
+          cp "$QCACLD_DIR/qca_cld3_qca6750.ko" "$VB_RAMDISK_DIR/lib/modules/$UNAME/"
+
+          VB_LIST="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/vendor_boot.modules.include"
+          if [[ -f "$VB_LIST" ]]; then
+            while IFS= read -r mod; do
+              [[ -z "$mod" ]] && continue
+              find "$OUT/modules_staging/lib/modules/$UNAME" -name "$mod" -exec cp {} "$VB_RAMDISK_DIR/lib/modules/$UNAME/" \;
+            done < "$VB_LIST"
+          fi
+
+          depmod -b "$VB_RAMDISK_DIR" "$UNAME"
+          mkbootfs "$VB_RAMDISK_DIR" | gzip -c > "$DIST/ramdisk.img"
+
+          DTB_FILE="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/dtb"
+          BOOTCONFIG="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/bootconfig"
+          CMDLINE_FILE="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/cmdline.txt"
+          if [[ -f "$CMDLINE_FILE" ]]; then
+            VENDOR_CMDLINE=$(cat "$CMDLINE_FILE")
+          else
+            VENDOR_CMDLINE="bootconfig"
+          fi
+
+          mkbootimg --header_version 4 \
+            --vendor_cmdline "$VENDOR_CMDLINE" \
+            --vendor_ramdisk "$DIST/ramdisk.img" \
+            --dtb "$DTB_FILE" \
+            --vendor_bootconfig "$BOOTCONFIG" \
+            --vendor_boot "$DIST/vendor_boot.img" 2>/dev/null || \
+          mkbootimg --header_version 4 \
+            --vendor_ramdisk "$DIST/ramdisk.img" \
+            --dtb "$DTB_FILE" \
+            --vendor_boot "$DIST/vendor_boot.img"
+
+          avbtool add_hash_footer --partition_name vendor_boot --partition_size 100663296 --image "$DIST/vendor_boot.img" --algorithm SHA256_RSA4096 --key "$KERNEL_KIT/tools/mkbootimg/gki/testdata/testkey_rsa4096.pem" 2>/dev/null || true
+
+          # 6. Packaging AnyKernel3 Zip
           STAGE="$(mktemp -d)"
-          git clone --depth=1 "$ANYKERNEL_REPO" "$STAGE"
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$STAGE"
           rm -rf "$STAGE/.git"
-          sed -i 's/device.name1=.*/device.name1=peridot/g' "$STAGE/anykernel.sh"
-          sed -i 's/device.name2=.*/device.name2=pineapple/g' "$STAGE/anykernel.sh"
-          sed -i 's/BLOCK=.*/BLOCK=auto;/g' "$STAGE/anykernel.sh"
-          sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=1;/g' "$STAGE/anykernel.sh"
+          sed -i 's/device.name1=.*/device.name1=peridot/g; s/device.name2=.*/device.name2=pineapple/g; s/BLOCK=.*/BLOCK=auto;/g; s/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=1;/g' "$STAGE/anykernel.sh"
 
-          cp -f "$IMG" "$STAGE/Image"
-          if [[ -f "$QCACLD_DIR/qca_cld3_qca6750.ko" ]]; then
-            cp -f "$QCACLD_DIR/qca_cld3_qca6750.ko" "$STAGE/qca_cld3_qca6750.ko"
-          fi
-          # Ship dtbo.img inside the flashable zip too (for manual fastboot users)
-          if [[ -f "$DIST/dtbo-$FLAVOR.img" ]]; then
-            cp -f "$DIST/dtbo-$FLAVOR.img" "$STAGE/dtbo.img"
-          fi
+          cp -f "$OUT/arch/arm64/boot/Image" "$STAGE/Image"
+          cp -f "$QCACLD_DIR/qca_cld3_qca6750.ko" "$STAGE/"
 
-          # --- CAVEAT-1 FIX: install the .ko via anykernel.sh (best-effort) ---
-          # AnyKernel3 only writes the boot image; without this block the .ko
-          # sits unused in the zip root. We try /vendor_dlkm first (Android 12+
-          # dynamic partition), then /vendor (older layouts). If neither is
-          # writable (e.g. Lineage recovery without mounted logical partitions),
-          # we drop the .ko on /sdcard so the Magisk module remains the fallback.
           cat << 'AKEOF' >> "$STAGE/anykernel.sh"
-
-          ## Lucy: install monitor-mode wlan module (best effort)
           if [ -f "$AKHOME/qca_cld3_qca6750.ko" ]; then
-              Lucy_installed=0
               for Lucy_tgt in /vendor_dlkm/lib/modules/qca_cld3_qca6750.ko /vendor/lib/modules/qca_cld3_qca6750.ko; do
                   Lucy_tdir=$(dirname "$Lucy_tgt")
-                  Lucy_tdev=$(echo "$Lucy_tgt" | cut -d/ -f1-2)
                   if [ -d "$Lucy_tdir" ]; then
-                      mount -o rw,remount "$Lucy_tdev" 2>/dev/null || true
-                      if cp -f "$AKHOME/qca_cld3_qca6750.ko" "$Lucy_tgt" 2>/dev/null; then
-                          chmod 644 "$Lucy_tgt"
-                          chown 0:0 "$Lucy_tgt" 2>/dev/null || true
-                          restorecon "$Lucy_tgt" 2>/dev/null || true
-                          echo "  - Lucy: installed qca_cld3_qca6750.ko to $Lucy_tdir"
-                          Lucy_installed=1
-                          break
-                      fi
+                      mount -o rw,remount "$(echo "$Lucy_tgt" | cut -d/ -f1-2)" 2>/dev/null || true
+                      cp -f "$AKHOME/qca_cld3_qca6750.ko" "$Lucy_tgt" 2>/dev/null && \
+                      { chmod 644 "$Lucy_tgt"; chown 0:0 "$Lucy_tgt"; restorecon "$Lucy_tgt" 2>/dev/null; break; }
                   fi
               done
-              if [ "$Lucy_installed" = "0" ]; then
-                  mkdir -p /sdcard/Lucy-monitor
-                  cp -f "$AKHOME/qca_cld3_qca6750.ko" /sdcard/Lucy-monitor/ 2>/dev/null || true
-                  echo "  - Lucy: could not auto-install .ko (vendor_dlkm not mounted rw)"
-                  echo "  - Lucy: .ko copied to /sdcard/Lucy-monitor/ if /sdcard is accessible"
-                  echo "  - Lucy: use the Magisk module for guaranteed installation"
-              fi
           fi
-          ## end Lucy custom
           AKEOF
-          # --- END CAVEAT-1 FIX ---
 
-          STAMP="$(date -u +%Y%m%d)"
-          SHA="$(git rev-parse --short=7 HEAD 2>/dev/null || echo local)"
-          ZIP_NAME="${ZIP_PREFIX}-${FLAVOR}-${ZIP_VERSION}-${STAMP}-${SHA}.zip"
-          (cd "$STAGE" && zip -r9q "$DIST/$ZIP_NAME" .)
+          (cd "$STAGE" && zip -r9q "$DIST/Lucy-Monitor-${FLAVOR}-$(date -u +%Y%m%d)-$(git rev-parse --short=7 HEAD).zip" .)
           rm -rf "$STAGE"
-          log "Packaged unified flashable zip: $DIST/$ZIP_NAME"
 
-          # 7. Build Universal Magisk/KernelSU Module (unchanged)
-          if [[ -f "$QCACLD_DIR/qca_cld3_qca6750.ko" ]]; then
-            log "Packaging Universal Magisk/KernelSU Module..."
-            MAGISK_DIR="$(mktemp -d)"
-            mkdir -p "$MAGISK_DIR/META-INF/com/google/android"
-            mkdir -p "$MAGISK_DIR/system/bin"
-
-            curl -sL -o "$MAGISK_DIR/META-INF/com/google/android/update-binary" "https://raw.githubusercontent.com/topjohnwu/Magisk/master/scripts/module_installer.sh"
-            chmod +x "$MAGISK_DIR/META-INF/com/google/android/update-binary"
-            echo "#MAGISK" > "$MAGISK_DIR/META-INF/com/google/android/updater-script"
-
-            cat << 'EOF' > "$MAGISK_DIR/module.prop"
-          id=Lucy-wifi
-          name=Universal QCA6750 Monitor Mode Wi-Fi
-          version=v1.0
-          versionCode=1
-          author=Raju-yeager
-          description=Custom QCA6750 Wi-Fi module for POCO F6 (peridot). Adapts vermagic to active kernel at boot.
-          EOF
-
-            cat << 'EOF' > "$MAGISK_DIR/customize.sh"
-          ui_print "- Installing Universal QCA6750 Monitor Mode Wi-Fi"
-          ui_print "- Automatically patches vermagic on boot to match your active kernel."
-          EOF
-
-            cp "$QCACLD_DIR/qca_cld3_qca6750.ko" "$MAGISK_DIR/qca_cld3_qca6750_original.ko"
-
-            cat << 'EOF' > "$MAGISK_DIR/post-fs-data.sh"
-          #!/system/bin/sh
-          MODDIR=${0%/*}
-          KO_FILE="$MODDIR/qca_cld3_qca6750.ko"
-          ORIG_FILE="$MODDIR/qca_cld3_qca6750_original.ko"
-          KVER="$(uname -r)"
-
-          if [ ! -f "$KO_FILE" ] || ! grep -q "vermagic=$KVER " "$KO_FILE"; then
-              cp "$ORIG_FILE" "$KO_FILE"
-              OFFSET=$(grep -aob "vermagic=" "$KO_FILE" | head -n 1 | cut -d: -f1)
-              if [ -n "$OFFSET" ]; then
-                  printf "vermagic=%s SMP preempt mod_unload modversions aarch64\0" "$KVER" > "$MODDIR/new_vermagic"
-                  dd if="$MODDIR/new_vermagic" of="$KO_FILE" bs=1 seek="$OFFSET" conv=notrunc status=none
-                  rm -f "$MODDIR/new_vermagic"
-              fi
-          fi
-          EOF
-            chmod +x "$MAGISK_DIR/post-fs-data.sh"
-
-            cat << 'EOF' > "$MAGISK_DIR/system/bin/wlan-mode"
-          #!/system/bin/sh
-          MODDIR="/data/adb/modules/Lucy-wifi"
-          STOCK_KO=$(find /vendor_dlkm /vendor /system -type f -name qca_cld3_qca6750.ko | head -n 1)
-          MOD_KO="$MODDIR/qca_cld3_qca6750.ko"
-
-          if [ "$1" = "mon" ]; then
-              echo "[+] Enabling Monitor Mode..."
-              svc wifi disable
-              ip link set wlan0 down
-              rmmod qca_cld3_qca6750 2>/dev/null
-              mount --bind "$MOD_KO" "$STOCK_KO"
-              insmod "$STOCK_KO"
-              iw dev wlan0 set type monitor 2>/dev/null || echo 4 > /sys/module/qca_cld3_qca6750/parameters/con_mode
-              ip link set wlan0 up
-              [ -n "$2" ] && iw dev wlan0 set channel "$2"
-              echo "[+] wlan0 is now in Monitor Mode"
-          elif [ "$1" = "sta" ]; then
-              echo "[+] Restoring Normal Android Wi-Fi..."
-              ip link set wlan0 down
-              umount "$STOCK_KO" 2>/dev/null
-              rmmod qca_cld3_qca6750 2>/dev/null
-              insmod "$STOCK_KO"
-              echo 0 > /sys/module/qca_cld3_qca6750/parameters/con_mode 2>/dev/null
-              svc wifi enable
-              echo "[+] Normal Android Wi-Fi restored."
-          else
-              echo "Usage: su -c wlan-mode [mon <channel> | sta]"
-          fi
-          EOF
-            chmod +x "$MAGISK_DIR/system/bin/wlan-mode"
-
-            (cd "$MAGISK_DIR" && zip -r9q "$DIST/Universal-Lucy-WiFi-Magisk-${ZIP_VERSION}.zip" .)
-            rm -rf "$MAGISK_DIR"
-            log "Packaged Universal Magisk Module: $DIST/Universal-Lucy-WiFi-Magisk-${ZIP_VERSION}.zip"
-          fi
-
-          # 8. Collect ALL .ko modules into a single zip
-          #    (in-tree kernel modules + out-of-tree WLAN + anything shipped in modules_src)
-          log "Collecting every .ko into a single module archive..."
-          KO_STAGE="$DIST/ko-collection"
-          rm -rf "$KO_STAGE"
-          mkdir -p "$KO_STAGE"
-
-          collect_kos() {
-            local src_root="$1" dest_prefix="$2"
-            [[ -d "$src_root" ]] || return 0
-            while IFS= read -r -d '' ko; do
-              local rel="${ko#$src_root/}"
-              mkdir -p "$KO_STAGE/$dest_prefix/$(dirname "$rel")"
-              cp -f "$ko" "$KO_STAGE/$dest_prefix/$rel"
-            done < <(find "$src_root" -type f \
-                       \( -name '*.ko' -o -name '*.ko.gz' -o -name '*.ko.xz' -o -name '*.ko.zst' \) \
-                       -not -path '*/.git/*' -print0)
-          }
-
-          collect_kos "$OUT"              "in-tree"
-          collect_kos "$QCACLD_DIR"       "out-of-tree/wlan"
-          collect_kos "$ROOT/modules_src" "modules_src"
-
-          [[ -f "$OUT/Module.symvers" ]] && cp -f "$OUT/Module.symvers" "$KO_STAGE/Module.symvers"
-          [[ -f "$OUT/.config"       ]] && cp -f "$OUT/.config"        "$KO_STAGE/kernel.config"
-          [[ -f "$IMG"               ]] && cp -f "$IMG"               "$KO_STAGE/Image"
-          [[ -f "$DIST/dtbo-$FLAVOR.img" ]] && cp -f "$DIST/dtbo-$FLAVOR.img" "$KO_STAGE/dtbo.img"
-
-          {
-            echo "Lucy module collection"
-            echo "Kernel:    $(head -n 4 "$ROOT/Makefile" | tr '\n' ' ')"
-            echo "Toolchain: $(clang --version | head -n 1)"
-            echo "Commit:    $(git rev-parse HEAD 2>/dev/null || echo unknown)"
-            echo "Date:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "HOST:      ${KBUILD_BUILD_HOST}  USER: ${KBUILD_BUILD_USER}"
-            echo ""
-            echo "Layout:"
-            echo "  in-tree/            modules built from the kernel tree"
-            echo "  out-of-tree/wlan/   qca_cld3_qca6750.ko built out-of-tree"
-            echo "  modules_src/        any .ko shipped in the cloned modules repo"
-            echo "  Module.symvers      kernel symbol version map"
-            echo "  kernel.config       resolved .config"
-            echo "  Image               built boot Image (if any)"
-            echo "  dtbo.img            device-tree overlay image (if generated)"
-            echo ""
-            echo "Modules ($(find "$KO_STAGE" -type f -name '*.ko*' | wc -l) total):"
-            find "$KO_STAGE" -type f -name '*.ko*' | sed "s|$KO_STAGE/||" | sort
-          } > "$KO_STAGE/README.txt"
-
-          KO_ZIP="$DIST/Lucy-All-Modules-${ZIP_VERSION}-${STAMP}-${SHA}.zip"
-          (cd "$KO_STAGE" && zip -r9q "$KO_ZIP" .)
-          KO_COUNT=$(find "$KO_STAGE" -type f -name '*.ko*' | wc -l)
-          KO_SIZE=$(du -h "$KO_ZIP" | cut -f1)
-          rm -rf "$KO_STAGE"
-          log "Packaged $KO_COUNT modules into $KO_ZIP ($KO_SIZE)"
+      - name: Fetch NetHunter Wireless Firmware
+        run: |
+          mkdir -p dist
+          # Download the community NetHunter wireless firmware Magisk module
+          curl -sL -o dist/nethunter-wireless-firmware.zip "https://github.com/Magisk-Modules-Repo/wirelessFirmware/releases/latest/download/wirelessFirmware.zip" || \
+          curl -sL -o dist/nethunter-wireless-firmware.zip "https://github.com/rithvikvibhu/nh-magisk-wifi-firmware/archive/refs/heads/master.zip"
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
@@ -551,16 +260,14 @@ jobs:
           name: Lucy-SM8635-Packages-${{ github.sha }}
           path: |
             dist/*.zip
+            dist/*.img
             dist/Image-*
-            dist/dtbo-*.img
-            dist/dtb-*/*
           if-no-files-found: error
 
       - name: Upload Logs on Failure
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: Lucy-Build-Logs-Debug
-          path: |
-            out/*.log
+          path: out/*.log
           if-no-files-found: ignore
