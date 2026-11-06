@@ -106,13 +106,14 @@ jobs:
           curl -sL https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT | base64 -d | sudo tee /usr/local/bin/avbtool > /dev/null
           sudo chmod +x /usr/local/bin/avbtool
 
-      - name: Setup Neutron Clang Toolchain
+      - name: Setup Neutron Clang Toolchain (v23)
         run: |
           mkdir -p "$HOME/clang"
           cd "$HOME/clang"
           curl -sL "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman" -o antman
           chmod +x antman
-          ./antman -S
+          # Sync a specific Clang 23 release tag
+          ./antman -S=23052026
           ./antman --patch=glibc
           
           echo "CLANG_DIR=$HOME/clang" >> "$GITHUB_ENV"
@@ -352,9 +353,6 @@ jobs:
 
           echo "::group::3. Compile External Modules (Following build.config order)"
           
-          export KERNEL_SRC="$ROOT"
-          export ROOT_DIR="$ROOT"
-
           MAKE_FLAGS=(
             -j$(nproc --all)
             LLVM=1
@@ -365,8 +363,7 @@ jobs:
             HOSTCXX="ccache clang++"
             CC="ccache clang"
             KERNEL_SRC="$ROOT"
-            KCFLAGS="-Wno-error -include linux/stringify.h"
-            EXTRA_CFLAGS="-Wno-error -include linux/stringify.h"
+            KCFLAGS="$WARN_FLAGS"
           )
 
           EXTRA_SYMBOLS=""
@@ -382,24 +379,6 @@ jobs:
             echo "Building $EXT_MOD_ACTUAL..."
             
             EXT_MOD_REL=$(realpath -s --relative-to="$ROOT" "$ROOT/$EXT_MOD_ACTUAL")
-
-            # Per-module extra include paths (absolute: the compiler runs from $OUT, not the module dir)
-            MOD_INC=""
-            if [[ "$EXT_MOD_ACTUAL" == *"audio-kernel"* ]]; then
-              AUDIO_DIR="$(realpath "$ROOT/$EXT_MOD_ACTUAL")"
-              MOD_INC="-I$AUDIO_DIR/include"
-
-              # The command-line KCFLAGS/EXTRA_CFLAGS can hide the module's own include/config flags,
-              # so force-include the SoC config header that defines CONFIG_SND_* (e.g. CONFIG_SND_EVENT).
-              echo "audio-kernel config dir:"; ls "$AUDIO_DIR/config" || true
-              AUDIO_CONF_H=$(grep -l "CONFIG_SND_SOC_PINEAPPLE" "$AUDIO_DIR"/config/*.h 2>/dev/null | head -n1 || true)
-              if [[ -n "$AUDIO_CONF_H" ]]; then
-                echo "Force-including $AUDIO_CONF_H"
-                MOD_INC="$MOD_INC -include $AUDIO_CONF_H"
-              else
-                echo "WARNING: no audio config header found in $AUDIO_DIR/config" >&2
-              fi
-            fi
             
             # Patch securemsm-kernel specifically to remove -Werror and stringify issues
             if [[ "$EXT_MOD_ACTUAL" == *"securemsm-kernel"* ]]; then
@@ -408,11 +387,6 @@ jobs:
               find "$ROOT/$EXT_MOD_ACTUAL" -type f -name "Kbuild" -exec sed -i 's/-Werror//g' {} + 2>/dev/null || true
               find "$ROOT/$EXT_MOD_ACTUAL" -name "trace_smcinvoke.h" -exec sed -i 's/__stringify(\(.*\))/\1/g' {} + 2>/dev/null || true
               find "$ROOT/$EXT_MOD_ACTUAL" -name "trace_smcinvoke.h" -exec sed -i '1i #include <linux/stringify.h>' {} + 2>/dev/null || true
-              # Point TRACE_INCLUDE_PATH at the real absolute dir (the hardcoded ../../../../sm8635-modules/... path doesn't exist here)
-              find "$ROOT/$EXT_MOD_ACTUAL" -name 'trace_*.h' | while read -r th; do
-                d=$(dirname "$(realpath "$th")")
-                sed -i -E "s|^(#define[[:space:]]+TRACE_INCLUDE_PATH[[:space:]]+).*|\1$d|" "$th"
-              done
             fi
             
             if [[ "$EXT_MOD_ACTUAL" == *"qcacld-3.0"* ]]; then
@@ -441,9 +415,7 @@ jobs:
               llvm-strip --strip-debug "$TARGET_DIR/qca_cld3_qca6750.ko"
             else
               # Using EXACTLY their MAKE_FLAGS logic
-              make -C "$EXT_MOD_REL" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT" \
-                KCFLAGS="-Wno-error -include linux/stringify.h $MOD_INC" \
-                EXTRA_CFLAGS="-Wno-error -include linux/stringify.h $MOD_INC"
+              make -C "$EXT_MOD_REL" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT"
               make -C "$EXT_MOD_REL" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT" INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_DIR="extra/$EXT_MOD_ACTUAL" modules_install
             fi
 
