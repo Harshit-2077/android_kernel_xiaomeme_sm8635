@@ -16,6 +16,11 @@ on:
         required: true
         type: string
         default: 'lineage-23.2'
+      compile_dlkm:
+        description: 'Build DLKMs, Modules & Boot Images (Uncheck for Kernel Image Only)'
+        required: true
+        type: boolean
+        default: true
       release_type:
         description: 'Select release type'
         required: true
@@ -28,7 +33,7 @@ on:
 
 permissions:
   contents: write
-  actions: write          # ← FIX #3: needed for `gh cache delete`
+  actions: write
 
 concurrency:
   group: build-${{ github.ref }}
@@ -38,7 +43,6 @@ env:
   CACHE_KEY_STATIC: cache-Lucy-peridot-v1
   OUT_DIR: ${{ github.workspace }}/out
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  # ← FIX #1: defaults used on push (where inputs.* are empty)
   KERNEL_REPO: ${{ inputs.kernel_repo || 'https://github.com/Harshit-2077/android_kernel_xiaomeme_sm8635.git' }}
   KERNEL_BRANCH: ${{ inputs.kernel_branch || 'lineage-23.2' }}
 
@@ -100,6 +104,9 @@ jobs:
 
           echo "Cloning kernel_kit..."
           git clone --depth=1 https://github.com/Harshit-2077/kernel_kit.git "$GITHUB_WORKSPACE/kernel_kit"
+          
+          echo "Cloning Modules Source..."
+          git clone --depth=1 --branch lineage-23.2 "https://github.com/Harshit-2077/android_kernel_xiaomi_sm8635-modules.git" "$GITHUB_WORKSPACE/modules_src"
 
           echo "KERNEL_KIT=$GITHUB_WORKSPACE/kernel_kit" >> "$GITHUB_ENV"
 
@@ -119,6 +126,10 @@ jobs:
           DIST="$GITHUB_WORKSPACE/dist"
           DYNAMIC_CACHE_DIR="$OUT/dynamic_cache"
           JOBS="$(nproc --all)"
+
+          # Check if we are compiling DLKMs/Boot images (defaults to true on push)
+          BUILD_IMAGES="${{ inputs.compile_dlkm }}"
+          if [[ "${{ github.event_name }}" == "push" ]]; then BUILD_IMAGES="true"; fi
 
           mkdir -p "$OUT" "$DIST" "$DYNAMIC_CACHE_DIR"
 
@@ -180,6 +191,14 @@ jobs:
             make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
           fi
 
+          # --- DROIDSPACES PATCH ---
+          echo "::group::Applying Droidspaces patch"
+          curl -sL "https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch" -o /tmp/droidspaces.patch
+          patch -p1 -F 3 -i /tmp/droidspaces.patch
+          echo "::endgroup::"
+
+          # --- NET HUNTER & OTHER CONFIGS ---
+          echo "::group::Applying NetHunter & Other Configs"
           ./scripts/config --file "$OUT/.config" \
             --set-str LOCALVERSION "-Lucy-Monitor" -d LOCALVERSION_AUTO -d WERROR \
             --set-val UCLAMP_BUCKETS_COUNT 20 -d TASK_DELAY_ACCT -d RSEQ -d SCHED_CLUSTER \
@@ -191,6 +210,72 @@ jobs:
             -m MI_HARDWARE_ID -m RFKILL -m CFG80211 -e NL80211_TESTMODE \
             -e CFG80211_REQUIRE_SIGNED_REGDB -e CFG80211_USE_KERNEL_REGDB_KEYS \
             -e CFG80211_DEFAULT_PS -d CFG80211_CRDA_SUPPORT -d CFG80211_WEXT -m MAC80211
+
+          # NetHunter: Bluetooth
+          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_BT_HCIBTUSB -e CONFIG_BT_HCIBTUSB_BCM -e CONFIG_BT_HCIBTUSB_RTL \
+            -e CONFIG_BT_HCIVHCI -e CONFIG_BT_HCIBCM203X -e CONFIG_BT_HCIBPA10X -e CONFIG_BT_HCIBFUSB
+
+          # NetHunter: Airspy & HackRF
+          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_USB_AIRSPY -e CONFIG_USB_HACKRF
+
+          # NetHunter: CAN
+          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_CAN -e CONFIG_CAN_DEV -e CONFIG_CAN_CALC_BITTIMING -e CONFIG_CAN_LEDS \
+            -e CONFIG_CAN_VCAN -e CONFIG_CAN_GRCAN -e CONFIG_CAN_XILINXCAN \
+            -e CONFIG_CAN_C_CAN -e CONFIG_CAN_C_CAN_PLATFORM -e CONFIG_CAN_C_CAN_PCI \
+            -e CONFIG_CAN_CC770 -e CONFIG_CAN_CC770_ISA -e CONFIG_CAN_CC770_PLATFORM \
+            -e CONFIG_CAN_M_CAN -e CONFIG_CAN_M_CAN_PCI -e CONFIG_CAN_M_CAN_PLATFORM -e CONFIG_CAN_M_CAN_TCAN4X5X \
+            -e CONFIG_CAN_HI311X -e CONFIG_CAN_MCP251X \
+            -e CONFIG_CAN_8DEV_USB -e CONFIG_CAN_EMS_USB -e CONFIG_CAN_ESD_USB2 \
+            -e CONFIG_CAN_GS_USB -e CONFIG_CAN_KVASER_USB -e CONFIG_CAN_PEAK_USB \
+            -e CONFIG_NETLINK_DIAG -e CONFIG_VSOCKETS -e CONFIG_NET_SCHED -e CONFIG_NET_EMATCH_CANID
+
+          # NetHunter: USB Serial
+          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_USB_SERIAL -e CONFIG_USB_SERIAL_CONSOLE -e CONFIG_USB_SERIAL_GENERIC \
+            -e CONFIG_USB_SERIAL_CH341 -e CONFIG_USB_SERIAL_FTDI_SIO -e CONFIG_USB_SERIAL_PL2303
+
+          # TTL Target Support
+          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_IP_NF_TARGET_TTL -e CONFIG_IP6_NF_TARGET_HL -e CONFIG_IP6_NF_MATCH_HL
+
+          # IP SET Support
+          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_IP_SET --set-val CONFIG_IP_SET_MAX 65534 \
+            -e CONFIG_IP_SET_BITMAP_IP -e CONFIG_IP_SET_BITMAP_IPMAC -e CONFIG_IP_SET_BITMAP_PORT \
+            -e CONFIG_IP_SET_HASH_IP -e CONFIG_IP_SET_HASH_IPMARK -e CONFIG_IP_SET_HASH_IPPORT \
+            -e CONFIG_IP_SET_HASH_IPPORTIP -e CONFIG_IP_SET_HASH_IPPORTNET -e CONFIG_IP_SET_HASH_IPMAC \
+            -e CONFIG_IP_SET_HASH_MAC -e CONFIG_IP_SET_HASH_NETPORTNET -e CONFIG_IP_SET_HASH_NET \
+            -e CONFIG_IP_SET_HASH_NETNET -e CONFIG_IP_SET_HASH_NETPORT -e CONFIG_IP_SET_HASH_NETIFACE \
+            -e CONFIG_IP_SET_LIST_SET
+
+          # Traffic Schedulers (qdisc)
+          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_NET_SCH_FQ -e CONFIG_NET_SCH_FQ_CODEL -e CONFIG_NET_SCH_CAKE \
+            -e CONFIG_NET_SCH_PIE -e CONFIG_NET_SCH_FQ_PIE
+
+          # SYSVIPC & Namespaces (Droidspaces)
+          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_SYSVIPC -e CONFIG_POSIX_MQUEUE -e CONFIG_PID_NS -e CONFIG_IPC_NS -e CONFIG_USER_NS
+
+          # Other misc configs
+          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_DEVTMPFS -e CONFIG_NETFILTER_XT_MATCH_ADDRTYPE \
+            -e CONFIG_NETFILTER_XT_SET -e CONFIG_NETFILTER_XT_TARGET_REJECT \
+            -e CONFIG_NETFILTER_XT_TARGET_LOG -e CONFIG_NETFILTER_XT_MATCH_RECENT
+          echo "::endgroup::"
+
+          # --- RTW88 MODULES ---
+          echo "::group::Adding rtw88 modules"
+          cd "$ROOT/drivers/net/wireless/realtek/"
+          rm -rf rtw88
+          git clone https://github.com/nullptr-t-oss/rtw88.git
+          sed -i 's/$(CONFIG_RTW88)/m/g' Makefile
+          sed -i '/^source "drivers\/net\/wireless\/realtek\/rtw88\/Kconfig"$/s/.*/ /' Kconfig
+          cd "$ROOT"
+          echo "::endgroup::"
 
           if declare -f compile_system_dlkm_modules > /dev/null; then
             echo "Executing compile_system_dlkm_modules from build.config..."
@@ -205,7 +290,7 @@ jobs:
             echo "::endgroup::"
           fi
 
-          K_MAKE_FLAGS=("-j$JOBS" "O=$OUT" "ARCH=arm64" "LLVM=1" "LLVM_IAS=1" "CC=ccache clang" "HOSTCC=ccache clang" "HOSTCXX=ccache clang++" "KBUILD_MODPOST_WARN=1" "KCFLAGS=$WARN_FLAGS")
+          K_MAKE_FLAGS=("-j$JOBS" "O=$OUT" "ARCH=arm64" "LLVM=1" "LLVM_IAS=1" "CC=ccache clang" "HOSTCC=ccache clang" "HOSTCXX=ccache clang++" "KCFLAGS=$WARN_FLAGS")
           if [[ -v MAKE_FLAGS ]]; then
              K_MAKE_FLAGS=("${MAKE_FLAGS[@]}")
           fi
@@ -222,131 +307,167 @@ jobs:
           cd "$ROOT"
           echo "::endgroup::"
 
-          echo "::group::2. Build system_dlkm & vendor_dlkm (His Way)"
+          if [[ "$BUILD_IMAGES" == "true" ]]; then
+            echo "::group::2. Build system_dlkm & vendor_dlkm (His Way)"
 
-          # 1. Export AOSP Build Tools Path (mkbootfs, mkuserimg_mke2fs)
-          if [[ -d "$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin" ]]; then
-            export PATH="$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin:$PATH"
-          elif [[ -d "$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux-x86/bin" ]]; then
-            export PATH="$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux-x86/bin:$PATH"
+            if [[ -d "$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin" ]]; then
+              export PATH="$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin:$PATH"
+            elif [[ -d "$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux-x86/bin" ]]; then
+              export PATH="$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux-x86/bin:$PATH"
+            fi
+
+            curl -sL https://android.googlesource.com/kernel/build/+/refs/heads/main/build_utils.sh?format=TEXT | base64 -d > "$ROOT/build_utils.sh"
+            source "$ROOT/build_utils.sh"
+
+            # system_dlkm
+            SYS_STAGE="$OUT/system_dlkm_staging"
+            rm -rf "$SYS_STAGE" && mkdir -p "$SYS_STAGE/lib/modules/$UNAME"
+            SYS_LIST="$KERNEL_KIT/device/peridot-los23.2/system_dlkm/system_dlkm.modules.include"
+            if [[ -f "$SYS_LIST" ]]; then
+              while IFS= read -r mod || [[ -n "$mod" ]]; do
+                [[ -z "$mod" ]] && continue
+                SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
+                [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$SYS_STAGE/lib/modules/$UNAME/"
+              done < "$SYS_LIST"
+            fi
+            cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$SYS_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
+
+            system_dlkm_props_file="$(mktemp)"
+            echo "system_dlkm_fs_type=ext4" >> "$system_dlkm_props_file"
+            echo "use_dynamic_partition_size=true" >> "$system_dlkm_props_file"
+            echo "ext_mkuserimg=mkuserimg_mke2fs" >> "$system_dlkm_props_file"
+            echo "ext4_share_dup_blocks=true" >> "$system_dlkm_props_file"
+            echo "extfs_rsv_pct=0" >> "$system_dlkm_props_file"
+            echo "journal_size=0" >> "$system_dlkm_props_file"
+
+            echo "Building system_dlkm with build_image..."
+            build_image "$SYS_STAGE" "$system_dlkm_props_file" "$DIST/system_dlkm.img" /dev/null
+            avbtool add_hashtree_footer --partition_name system_dlkm --hash_algorithm sha256 --image "$DIST/system_dlkm.img" --do_not_generate_fec
+
+            # vendor_dlkm
+            VEND_STAGE="$OUT/vendor_dlkm_staging"
+            rm -rf "$VEND_STAGE" && mkdir -p "$VEND_STAGE/lib/modules/$UNAME"
+            VEND_LIST="$KERNEL_KIT/device/peridot-los23.2/vendor_dlkm/vendor_dlkm.modules.include"
+            if [[ -f "$VEND_LIST" ]]; then
+              while IFS= read -r mod || [[ -n "$mod" ]]; do
+                [[ -z "$mod" ]] && continue
+                SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
+                [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$VEND_STAGE/lib/modules/$UNAME/"
+              done < "$VEND_LIST"
+            fi
+            cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$VEND_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
+
+            vendor_dlkm_props_file="$(mktemp)"
+            echo "vendor_dlkm_fs_type=ext4" >> "$vendor_dlkm_props_file"
+            echo "use_dynamic_partition_size=true" >> "$vendor_dlkm_props_file"
+            echo "ext_mkuserimg=mkuserimg_mke2fs" >> "$vendor_dlkm_props_file"
+            echo "ext4_share_dup_blocks=true" >> "$vendor_dlkm_props_file"
+
+            echo "Building vendor_dlkm with build_image..."
+            build_image "$VEND_STAGE" "$vendor_dlkm_props_file" "$DIST/vendor_dlkm.img" /dev/null
+            avbtool add_hashtree_footer --partition_name vendor_dlkm --hash_algorithm sha256 --image "$DIST/vendor_dlkm.img" --do_not_generate_fec
+            echo "::endgroup::"
+
+            echo "::group::3. Compile External Modules (Following build.config order)"
+            
+            EXTRA_SYMBOLS=""
+
+            for EXT_MOD in "${EXT_MODULES[@]}"; do
+              CLEAN_PATH="${EXT_MOD#../vendor/}"
+              TARGET_DIR="$GITHUB_WORKSPACE/modules_src/$CLEAN_PATH"
+              
+              if [[ ! -d "$TARGET_DIR" ]]; then
+                echo "WARNING: $CLEAN_PATH not found in modules_src, skipping."
+                continue
+              fi
+              
+              echo "Building $CLEAN_PATH..."
+              REL_PATH=$(realpath -s --relative-to="$ROOT" "$TARGET_DIR")
+              
+              if [[ "$EXT_MOD" == *"qcacld-3.0"* ]]; then
+                echo "Applying monitor mode configs to WLAN..."
+                ln -sfn ../qca-wifi-host-cmn "$TARGET_DIR/cmn"
+                for dcfg in "$TARGET_DIR/configs/"*qca6750* "$TARGET_DIR/configs/default_defconfig"; do
+                  [[ -f "$dcfg" ]] && { sed -i '/CONFIG_FEATURE_MONITOR_MODE_SUPPORT/d' "$dcfg"; echo "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y" >> "$dcfg"; }
+                done
+
+                export KBUILD_EXTRA_SYMBOLS="$EXTRA_SYMBOLS"
+
+                make -j"$JOBS" -C "$ROOT" O="$OUT" \
+                  M="$TARGET_DIR" \
+                  ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
+                  WLAN_ROOT="$TARGET_DIR" WLAN_COMMON_ROOT=cmn WLAN_COMMON_INC="$TARGET_DIR/cmn" \
+                  WLAN_FW_API="$TARGET_DIR/../fw-api/" CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
+                  CONFIG_CNSS_OUT_OF_TREE=y CONFIG_IPA_OUT_OF_TREE=y CONFIG_QCA_WIFI_ISOC=0 \
+                  CONFIG_QCA_WIFI_2_0=1 WLAN_PROFILE=qca6750 CONFIG_QCA_CLD_WLAN_PROFILE=qca6750 \
+                  CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y DYNAMIC_SINGLE_CHIP=qca6750 DEVNAME=qca6750 \
+                  MODNAME=qca_cld3_qca6750 CONFIG_QCA_CLD_WLAN=m \
+                  KCFLAGS="$WARN_FLAGS -DFEATURE_MONITOR_MODE_SUPPORT -DCONFIG_FEATURE_MONITOR_MODE_SUPPORT=1" \
+                  modules 2>&1 | tee "$OUT/wlan_build.log"
+
+                llvm-strip --strip-debug "$TARGET_DIR/qca_cld3_qca6750.ko"
+              else
+                make -j"$JOBS" -C "$ROOT" O="$OUT" M="$REL_PATH" \
+                  ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
+                  CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
+                  KCFLAGS="$WARN_FLAGS" \
+                  modules
+                  
+                make -j"$JOBS" -C "$ROOT" O="$OUT" M="$REL_PATH" \
+                  ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
+                  INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_DIR="extra/$CLEAN_PATH" \
+                  modules_install
+              fi
+
+              if [[ -f "$TARGET_DIR/Module.symvers" ]]; then
+                EXTRA_SYMBOLS+=" $TARGET_DIR/Module.symvers"
+              fi
+            done
+            echo "::endgroup::"
+
+            echo "::group::4. Vendor Boot Image (His Way)"
+            VB_RAMDISK_DIR="$OUT/vendor_boot_ramdisk"
+            mkdir -p "$VB_RAMDISK_DIR/lib/modules/$UNAME"
+            
+            WLAN_MOD_PATH="$GITHUB_WORKSPACE/modules_src/qcom/opensource/wlan/qcacld-3.0/qca_cld3_qca6750.ko"
+            if [[ -f "$WLAN_MOD_PATH" ]]; then
+              cp "$WLAN_MOD_PATH" "$VB_RAMDISK_DIR/lib/modules/$UNAME/"
+            fi
+
+            VB_LIST="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/vendor_boot.modules.include"
+            if [[ -f "$VB_LIST" ]]; then
+              while IFS= read -r mod || [[ -n "$mod" ]]; do
+                [[ -z "$mod" ]] && continue
+                SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
+                [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$VB_RAMDISK_DIR/lib/modules/$UNAME/"
+              done < "$VB_LIST"
+            fi
+
+            if [[ -d "$KERNEL_KIT/device/peridot-los23.2/vendor_boot/ramdisk" ]]; then
+               cp -r "$KERNEL_KIT/device/peridot-los23.2/vendor_boot/ramdisk/"* "$VB_RAMDISK_DIR/"
+            fi
+
+            depmod -b "$VB_RAMDISK_DIR" "$UNAME"
+
+            MKBOOTIMG_RAMDISK_CPIO="$DIST/ramdisk.cpio"
+            mkbootfs "$VB_RAMDISK_DIR" > "$MKBOOTIMG_RAMDISK_CPIO"
+            gzip -c -f "$MKBOOTIMG_RAMDISK_CPIO" > "$DIST/ramdisk.gz"
+
+            DTB_FILE="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/dtb"
+            BOOTCONFIG="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/bootconfig"
+
+            mkbootimg --header_version 4 \
+              --vendor_cmdline "bootconfig" \
+              --vendor_ramdisk "$DIST/ramdisk.gz" \
+              --dtb "$DTB_FILE" \
+              --vendor_bootconfig "$BOOTCONFIG" \
+              --vendor_boot "$DIST/vendor_boot.img"
+
+            avbtool add_hash_footer --partition_name vendor_boot --partition_size 100663296 --image "$DIST/vendor_boot.img" --algorithm SHA256_RSA4096 --key "$KERNEL_KIT/tools/mkbootimg/gki/testdata/testkey_rsa4096.pem"
+            echo "::endgroup::"
+          else
+            echo "Skipping DLKMs, External Modules, and Vendor Boot generation (compile_dlkm=false)."
           fi
-
-          # 2. Download build_utils.sh
-          curl -sL https://android.googlesource.com/kernel/build/+/refs/heads/main/build_utils.sh?format=TEXT | base64 -d > "$ROOT/build_utils.sh"
-          source "$ROOT/build_utils.sh"
-
-          # 3. Build system_dlkm using build_image
-          SYS_STAGE="$OUT/system_dlkm_staging"
-          rm -rf "$SYS_STAGE" && mkdir -p "$SYS_STAGE/lib/modules/$UNAME"
-          SYS_LIST="$KERNEL_KIT/device/peridot-los23.2/system_dlkm/system_dlkm.modules.include"
-          if [[ -f "$SYS_LIST" ]]; then
-            while IFS= read -r mod || [[ -n "$mod" ]]; do
-              [[ -z "$mod" ]] && continue
-              SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
-              [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$SYS_STAGE/lib/modules/$UNAME/"
-            done < "$SYS_LIST"
-          fi
-          cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$SYS_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
-
-          system_dlkm_props_file="$(mktemp)"
-          echo "system_dlkm_fs_type=ext4" >> "$system_dlkm_props_file"
-          echo "use_dynamic_partition_size=true" >> "$system_dlkm_props_file"
-          echo "ext_mkuserimg=mkuserimg_mke2fs" >> "$system_dlkm_props_file"
-          echo "ext4_share_dup_blocks=true" >> "$system_dlkm_props_file"
-          echo "extfs_rsv_pct=0" >> "$system_dlkm_props_file"
-          echo "journal_size=0" >> "$system_dlkm_props_file"
-
-          echo "Building system_dlkm with build_image..."
-          build_image "$SYS_STAGE" "$system_dlkm_props_file" "$DIST/system_dlkm.img" /dev/null
-          avbtool add_hashtree_footer --partition_name system_dlkm --hash_algorithm sha256 --image "$DIST/system_dlkm.img" --do_not_generate_fec
-
-          # 4. Build vendor_dlkm using build_image
-          VEND_STAGE="$OUT/vendor_dlkm_staging"
-          rm -rf "$VEND_STAGE" && mkdir -p "$VEND_STAGE/lib/modules/$UNAME"
-          VEND_LIST="$KERNEL_KIT/device/peridot-los23.2/vendor_dlkm/vendor_dlkm.modules.include"
-          if [[ -f "$VEND_LIST" ]]; then
-            while IFS= read -r mod || [[ -n "$mod" ]]; do
-              [[ -z "$mod" ]] && continue
-              SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
-              [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$VEND_STAGE/lib/modules/$UNAME/"
-            done < "$VEND_LIST"
-          fi
-          cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$VEND_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
-
-          vendor_dlkm_props_file="$(mktemp)"
-          echo "vendor_dlkm_fs_type=ext4" >> "$vendor_dlkm_props_file"
-          echo "use_dynamic_partition_size=true" >> "$vendor_dlkm_props_file"
-          echo "ext_mkuserimg=mkuserimg_mke2fs" >> "$vendor_dlkm_props_file"
-          echo "ext4_share_dup_blocks=true" >> "$vendor_dlkm_props_file"
-
-          echo "Building vendor_dlkm with build_image..."
-          build_image "$VEND_STAGE" "$vendor_dlkm_props_file" "$DIST/vendor_dlkm.img" /dev/null
-          avbtool add_hashtree_footer --partition_name vendor_dlkm --hash_algorithm sha256 --image "$DIST/vendor_dlkm.img" --do_not_generate_fec
-          echo "::endgroup::"
-
-          echo "::group::3. OOT WLAN Module Build"
-          git clone --depth=1 --branch lineage-23.2 "https://github.com/Harshit-2077/android_kernel_xiaomi_sm8635-modules.git" "$GITHUB_WORKSPACE/modules_src"
-          WLAN_DIR="$GITHUB_WORKSPACE/modules_src/qcom/opensource/wlan"
-          QCACLD_DIR="$WLAN_DIR/qcacld-3.0"
-          ln -sfn ../qca-wifi-host-cmn "$QCACLD_DIR/cmn"
-
-          for dcfg in "$QCACLD_DIR/configs/"*qca6750* "$QCACLD_DIR/configs/default_defconfig"; do
-            [[ -f "$dcfg" ]] && { sed -i '/CONFIG_FEATURE_MONITOR_MODE_SUPPORT/d' "$dcfg"; echo "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y" >> "$dcfg"; }
-          done
-
-          make -j"$JOBS" -C "$ROOT" O="$OUT" \
-            M="$QCACLD_DIR" \
-            CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
-            WLAN_ROOT="$QCACLD_DIR" WLAN_COMMON_ROOT=cmn WLAN_COMMON_INC="$QCACLD_DIR/cmn" \
-            WLAN_FW_API="$WLAN_DIR/fw-api/" CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
-            CONFIG_CNSS_OUT_OF_TREE=y CONFIG_IPA_OUT_OF_TREE=y CONFIG_QCA_WIFI_ISOC=0 \
-            CONFIG_QCA_WIFI_2_0=1 WLAN_PROFILE=qca6750 CONFIG_QCA_CLD_WLAN_PROFILE=qca6750 \
-            CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y DYNAMIC_SINGLE_CHIP=qca6750 DEVNAME=qca6750 \
-            MODNAME=qca_cld3_qca6750 CONFIG_QCA_CLD_WLAN=m \
-            KCFLAGS="$WARN_FLAGS -DFEATURE_MONITOR_MODE_SUPPORT -DCONFIG_FEATURE_MONITOR_MODE_SUPPORT=1" \
-            modules 2>&1 | tee "$OUT/wlan_build.log"
-
-          llvm-strip --strip-debug "$QCACLD_DIR/qca_cld3_qca6750.ko"
-          echo "::endgroup::"
-
-          echo "::group::4. Vendor Boot Image (His Way)"
-          VB_RAMDISK_DIR="$OUT/vendor_boot_ramdisk"
-          mkdir -p "$VB_RAMDISK_DIR/lib/modules/$UNAME"
-          cp "$QCACLD_DIR/qca_cld3_qca6750.ko" "$VB_RAMDISK_DIR/lib/modules/$UNAME/"
-
-          VB_LIST="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/vendor_boot.modules.include"
-          if [[ -f "$VB_LIST" ]]; then
-            while IFS= read -r mod || [[ -n "$mod" ]]; do
-              [[ -z "$mod" ]] && continue
-              SRC_MOD=$(find "$OUT/modules_staging/lib/modules/$UNAME" -path "*$mod" -print -quit)
-              [[ -n "$SRC_MOD" ]] && cp "$SRC_MOD" "$VB_RAMDISK_DIR/lib/modules/$UNAME/"
-            done < "$VB_LIST"
-          fi
-
-          if [[ -d "$KERNEL_KIT/device/peridot-los23.2/vendor_boot/ramdisk" ]]; then
-             cp -r "$KERNEL_KIT/device/peridot-los23.2/vendor_boot/ramdisk/"* "$VB_RAMDISK_DIR/"
-          fi
-
-          depmod -b "$VB_RAMDISK_DIR" "$UNAME"
-
-          # Use AOSP mkbootfs and gzip
-          MKBOOTIMG_RAMDISK_CPIO="$DIST/ramdisk.cpio"
-          mkbootfs "$VB_RAMDISK_DIR" > "$MKBOOTIMG_RAMDISK_CPIO"
-          gzip -c -f "$MKBOOTIMG_RAMDISK_CPIO" > "$DIST/ramdisk.gz"
-
-          DTB_FILE="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/dtb"
-          BOOTCONFIG="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/bootconfig"
-
-          mkbootimg --header_version 4 \
-            --vendor_cmdline "bootconfig" \
-            --vendor_ramdisk "$DIST/ramdisk.gz" \
-            --dtb "$DTB_FILE" \
-            --vendor_bootconfig "$BOOTCONFIG" \
-            --vendor_boot "$DIST/vendor_boot.img"
-
-          # ← FIX #4: fail loudly instead of shipping unsigned vendor_boot
-          avbtool add_hash_footer --partition_name vendor_boot --partition_size 100663296 --image "$DIST/vendor_boot.img" --algorithm SHA256_RSA4096 --key "$KERNEL_KIT/tools/mkbootimg/gki/testdata/testkey_rsa4096.pem"
-          echo "::endgroup::"
 
           echo "::group::5. Packaging Artifacts"
           STAGE="$(mktemp -d)"
@@ -355,9 +476,11 @@ jobs:
           sed -i 's/device.name1=.*/device.name1=peridot/g; s/device.name2=.*/device.name2=pineapple/g; s/BLOCK=.*/BLOCK=auto;/g; s/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=1;/g' "$STAGE/anykernel.sh"
 
           cp -f "$OUT/arch/arm64/boot/Image" "$STAGE/Image"
-          cp -f "$QCACLD_DIR/qca_cld3_qca6750.ko" "$STAGE/"
-
-          cat << 'AKEOF' >> "$STAGE/anykernel.sh"
+          
+          WLAN_MOD_PATH="$GITHUB_WORKSPACE/modules_src/qcom/opensource/wlan/qcacld-3.0/qca_cld3_qca6750.ko"
+          if [[ -f "$WLAN_MOD_PATH" ]]; then
+            cp -f "$WLAN_MOD_PATH" "$STAGE/"
+            cat << 'AKEOF' >> "$STAGE/anykernel.sh"
           if [ -f "$AKHOME/qca_cld3_qca6750.ko" ]; then
               for Lucy_tgt in /vendor_dlkm/lib/modules/qca_cld3_qca6750.ko /vendor/lib/modules/qca_cld3_qca6750.ko; do
                   Lucy_tdir=$(dirname "$Lucy_tgt")
@@ -368,7 +491,8 @@ jobs:
                   fi
               done
           fi
-          AKEOF
+AKEOF
+          fi
 
           (cd "$STAGE" && zip -r9q "$DIST/Lucy-Monitor-${FLAVOR}-$(date -u +%Y%m%d)-$(cd "$ROOT" && git rev-parse --short=7 HEAD).zip" .)
           rm -rf "$STAGE"
@@ -401,10 +525,9 @@ jobs:
             dist/*.zip
             dist/*.img
             dist/Image-*
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Create GitHub Release
-        # ← FIX #2: only run when explicitly requested (not on push)
         if: ${{ inputs.release_type == 'Release' || inputs.release_type == 'Pre-release' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
