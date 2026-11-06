@@ -10,7 +10,7 @@ on:
         description: 'Kernel Repository URL'
         required: true
         type: string
-        default: 'https://github.com/Harshit-2077/android_kernel_xiaomi_sm8635.git'
+        default: 'https://github.com/Harshit-2077/android_kernel_xiaomeme_sm8635.git'
       kernel_branch:
         description: 'Kernel Branch'
         required: true
@@ -28,6 +28,7 @@ on:
 
 permissions:
   contents: write
+  actions: write          # ← FIX #3: needed for `gh cache delete`
 
 concurrency:
   group: build-${{ github.ref }}
@@ -37,6 +38,9 @@ env:
   CACHE_KEY_STATIC: cache-Lucy-peridot-v1
   OUT_DIR: ${{ github.workspace }}/out
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # ← FIX #1: defaults used on push (where inputs.* are empty)
+  KERNEL_REPO: ${{ inputs.kernel_repo || 'https://github.com/Harshit-2077/android_kernel_xiaomeme_sm8635.git' }}
+  KERNEL_BRANCH: ${{ inputs.kernel_branch || 'lineage-23.2' }}
 
 jobs:
   build:
@@ -91,12 +95,12 @@ jobs:
 
       - name: Clone Kernel Source & Kernel Kit
         run: |
-          echo "Cloning kernel source..."
-          git clone --depth=1 --branch "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo }}" "$GITHUB_WORKSPACE/kernel_src"
-          
+          echo "Cloning kernel source from $KERNEL_REPO ($KERNEL_BRANCH)..."
+          git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_REPO" "$GITHUB_WORKSPACE/kernel_src"
+
           echo "Cloning kernel_kit..."
           git clone --depth=1 https://github.com/Harshit-2077/kernel_kit.git "$GITHUB_WORKSPACE/kernel_kit"
-          
+
           echo "KERNEL_KIT=$GITHUB_WORKSPACE/kernel_kit" >> "$GITHUB_ENV"
 
       - name: Restore Build Cache
@@ -115,15 +119,15 @@ jobs:
           DIST="$GITHUB_WORKSPACE/dist"
           DYNAMIC_CACHE_DIR="$OUT/dynamic_cache"
           JOBS="$(nproc --all)"
-          
+
           mkdir -p "$OUT" "$DIST" "$DYNAMIC_CACHE_DIR"
 
           export PATH="$CLANG_DIR/bin:$PATH"
           export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
           export KBUILD_BUILD_USER="Harshit-2077" KBUILD_BUILD_HOST="Lucy"
-          
+
           export ROOT_DIR="$ROOT"
-          export KERNEL_DIR="$ROOT" 
+          export KERNEL_DIR="$ROOT"
           export SOC="cliffs"
           export CODENAME="peridot"
           export OS_SHORT="los23.2"
@@ -148,7 +152,7 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::1. Defconfig & Compile"
-          
+
           MTIME_CACHE="$KERNEL_KIT/scripts/dynamic_mtime.sh"
           if [[ -f "$MTIME_CACHE" ]]; then
             chmod +x "$MTIME_CACHE"
@@ -187,12 +191,12 @@ jobs:
             -m MI_HARDWARE_ID -m RFKILL -m CFG80211 -e NL80211_TESTMODE \
             -e CFG80211_REQUIRE_SIGNED_REGDB -e CFG80211_USE_KERNEL_REGDB_KEYS \
             -e CFG80211_DEFAULT_PS -d CFG80211_CRDA_SUPPORT -d CFG80211_WEXT -m MAC80211
-          
+
           if declare -f compile_system_dlkm_modules > /dev/null; then
             echo "Executing compile_system_dlkm_modules from build.config..."
             compile_system_dlkm_modules
           fi
-          
+
           make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
           if [[ -f "$MTIME_CACHE" ]]; then
@@ -219,7 +223,7 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::2. Build system_dlkm & vendor_dlkm (His Way)"
-          
+
           # 1. Export AOSP Build Tools Path (mkbootfs, mkuserimg_mke2fs)
           if [[ -d "$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin" ]]; then
             export PATH="$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin:$PATH"
@@ -243,7 +247,7 @@ jobs:
             done < "$SYS_LIST"
           fi
           cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$SYS_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
-          
+
           system_dlkm_props_file="$(mktemp)"
           echo "system_dlkm_fs_type=ext4" >> "$system_dlkm_props_file"
           echo "use_dynamic_partition_size=true" >> "$system_dlkm_props_file"
@@ -268,7 +272,7 @@ jobs:
             done < "$VEND_LIST"
           fi
           cp "$OUT/modules_staging/lib/modules/$UNAME/modules."{alias,dep,softdep} "$VEND_STAGE/lib/modules/$UNAME/" 2>/dev/null || true
-          
+
           vendor_dlkm_props_file="$(mktemp)"
           echo "vendor_dlkm_fs_type=ext4" >> "$vendor_dlkm_props_file"
           echo "use_dynamic_partition_size=true" >> "$vendor_dlkm_props_file"
@@ -290,7 +294,6 @@ jobs:
             [[ -f "$dcfg" ]] && { sed -i '/CONFIG_FEATURE_MONITOR_MODE_SUPPORT/d' "$dcfg"; echo "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y" >> "$dcfg"; }
           done
 
-          export KBUILD_EXTRA_SYMBOLS="$OUT/Module.symvers"
           make -j"$JOBS" -C "$ROOT" O="$OUT" \
             M="$QCACLD_DIR" \
             CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
@@ -302,7 +305,7 @@ jobs:
             MODNAME=qca_cld3_qca6750 CONFIG_QCA_CLD_WLAN=m \
             KCFLAGS="$WARN_FLAGS -DFEATURE_MONITOR_MODE_SUPPORT -DCONFIG_FEATURE_MONITOR_MODE_SUPPORT=1" \
             modules 2>&1 | tee "$OUT/wlan_build.log"
-          
+
           llvm-strip --strip-debug "$QCACLD_DIR/qca_cld3_qca6750.ko"
           echo "::endgroup::"
 
@@ -325,7 +328,7 @@ jobs:
           fi
 
           depmod -b "$VB_RAMDISK_DIR" "$UNAME"
-          
+
           # Use AOSP mkbootfs and gzip
           MKBOOTIMG_RAMDISK_CPIO="$DIST/ramdisk.cpio"
           mkbootfs "$VB_RAMDISK_DIR" > "$MKBOOTIMG_RAMDISK_CPIO"
@@ -333,7 +336,7 @@ jobs:
 
           DTB_FILE="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/dtb"
           BOOTCONFIG="$KERNEL_KIT/device/peridot-los23.2/vendor_boot/bootconfig"
-          
+
           mkbootimg --header_version 4 \
             --vendor_cmdline "bootconfig" \
             --vendor_ramdisk "$DIST/ramdisk.gz" \
@@ -341,7 +344,8 @@ jobs:
             --vendor_bootconfig "$BOOTCONFIG" \
             --vendor_boot "$DIST/vendor_boot.img"
 
-          avbtool add_hash_footer --partition_name vendor_boot --partition_size 100663296 --image "$DIST/vendor_boot.img" --algorithm SHA256_RSA4096 --key "$KERNEL_KIT/tools/mkbootimg/gki/testdata/testkey_rsa4096.pem" 2>/dev/null || true
+          # ← FIX #4: fail loudly instead of shipping unsigned vendor_boot
+          avbtool add_hash_footer --partition_name vendor_boot --partition_size 100663296 --image "$DIST/vendor_boot.img" --algorithm SHA256_RSA4096 --key "$KERNEL_KIT/tools/mkbootimg/gki/testdata/testkey_rsa4096.pem"
           echo "::endgroup::"
 
           echo "::group::5. Packaging Artifacts"
@@ -400,12 +404,13 @@ jobs:
           if-no-files-found: error
 
       - name: Create GitHub Release
-        if: inputs.release_type != 'none'
+        # ← FIX #2: only run when explicitly requested (not on push)
+        if: ${{ inputs.release_type == 'Release' || inputs.release_type == 'Pre-release' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          
+
           BASE_TAG="Lucy-peridot"
           LATEST_N=$(gh api "repos/${{ github.repository }}/tags" --paginate --jq '.[].name' \
             | grep -E "^${BASE_TAG}-r[0-9]+$" \
@@ -419,7 +424,7 @@ jobs:
           fi
 
           echo "Creating release: ${NEW_TAG}"
-          
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag "${NEW_TAG}"
