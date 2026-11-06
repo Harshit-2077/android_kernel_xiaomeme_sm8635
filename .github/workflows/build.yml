@@ -49,7 +49,7 @@ env:
   FLAVOR: "Lucy-monitor"
   ROOT: "${{ github.workspace }}/kernel_src"
   ROOT_DIR: "${{ github.workspace }}/kernel_src"
-  KERNEL_DIR: "."  # Tells build.config the kernel is at the root
+  KERNEL_DIR: "."
   OUT: "${{ github.workspace }}/out"
   DIST: "${{ github.workspace }}/dist"
   DYNAMIC_CACHE_DIR: "${{ github.workspace }}/out/dynamic_cache"
@@ -115,7 +115,6 @@ jobs:
           ./antman -S
           ./antman --patch=glibc
           
-          # Add clang to GITHUB_PATH so ALL subsequent steps use it
           echo "CLANG_DIR=$HOME/clang" >> "$GITHUB_ENV"
           echo "$HOME/clang/bin" >> "$GITHUB_PATH"
 
@@ -130,7 +129,6 @@ jobs:
           echo "Cloning Modules Source..."
           git clone --depth=1 --branch lineage-23.2 "https://github.com/Harshit-2077/android_kernel_xiaomi_sm8635-modules.git" "$GITHUB_WORKSPACE/modules_src"
           
-          # Create symlink so the directory structure matches standard AOSP expectations for vendor modules
           ln -sfn "$GITHUB_WORKSPACE/modules_src" "$GITHUB_WORKSPACE/vendor"
 
       - name: Restore Build Cache
@@ -159,7 +157,6 @@ jobs:
           if [[ -f "$ROOT/certs/extract-cert.c" ]]; then
             sed -i '/static.*key_pass/d' "$ROOT/certs/extract-cert.c"
             sed -i '1i __attribute__((unused)) static const char *key_pass;' "$ROOT/certs/extract-cert.c"
-            echo "Patched certs/extract-cert.c for OpenSSL 3.0"
           fi
           echo "::endgroup::"
 
@@ -168,22 +165,16 @@ jobs:
           MTIME_CACHE="$KERNEL_KIT/scripts/dynamic_mtime.sh"
           if [[ -f "$MTIME_CACHE" ]]; then
             chmod +x "$MTIME_CACHE"
-            echo "::group::Restore File Timestamps (-t)"
             "$MTIME_CACHE" -t -d "$ROOT" -k kernel
-            echo "::endgroup::"
           fi
 
           BUILD_CONFIG="$KERNEL_KIT/device/peridot-los23.2/build_config/build.config.peridot.los23.2"
           if [[ -f "$BUILD_CONFIG" ]]; then
-            echo "Sourcing build config: $BUILD_CONFIG"
             set +u
             set -a
             source "$BUILD_CONFIG"
             set +a
             set -u
-          else
-            echo "::error::build.config not found!"
-            exit 1
           fi
 
           if [[ -v CONFIGS_GKI ]]; then
@@ -192,13 +183,11 @@ jobs:
             make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
           fi
 
-          # --- DROIDSPACES PATCH ---
           echo "::group::Applying Droidspaces patch"
           curl -sL "https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch" -o /tmp/droidspaces.patch
           patch -p1 -F 3 -i /tmp/droidspaces.patch
           echo "::endgroup::"
 
-          # --- NET HUNTER & OTHER CONFIGS ---
           echo "::group::Applying NetHunter & Other Configs"
           ./scripts/config --file "$OUT/.config" \
             --set-str LOCALVERSION "-Lucy-Monitor" -d LOCALVERSION_AUTO -d WERROR \
@@ -210,16 +199,10 @@ jobs:
             -d MODULE_SIG -d MODULE_SIG_FORCE -d MODULE_SIG_ALL \
             -m MI_HARDWARE_ID -m RFKILL -m CFG80211 -e NL80211_TESTMODE \
             -e CFG80211_REQUIRE_SIGNED_REGDB -e CFG80211_USE_KERNEL_REGDB_KEYS \
-            -e CFG80211_DEFAULT_PS -d CFG80211_CRDA_SUPPORT -d CFG80211_WEXT -m MAC80211
-
-          ./scripts/config --file "$OUT/.config" \
+            -e CFG80211_DEFAULT_PS -d CFG80211_CRDA_SUPPORT -d CFG80211_WEXT -m MAC80211 \
             -e CONFIG_BT_HCIBTUSB -e CONFIG_BT_HCIBTUSB_BCM -e CONFIG_BT_HCIBTUSB_RTL \
-            -e CONFIG_BT_HCIVHCI -e CONFIG_BT_HCIBCM203X -e CONFIG_BT_HCIBPA10X -e CONFIG_BT_HCIBFUSB
-
-          ./scripts/config --file "$OUT/.config" \
-            -e CONFIG_USB_AIRSPY -e CONFIG_USB_HACKRF
-
-          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_BT_HCIVHCI -e CONFIG_BT_HCIBCM203X -e CONFIG_BT_HCIBPA10X -e CONFIG_BT_HCIBFUSB \
+            -e CONFIG_USB_AIRSPY -e CONFIG_USB_HACKRF \
             -e CONFIG_CAN -e CONFIG_CAN_DEV -e CONFIG_CAN_CALC_BITTIMING -e CONFIG_CAN_LEDS \
             -e CONFIG_CAN_VCAN -e CONFIG_CAN_GRCAN -e CONFIG_CAN_XILINXCAN \
             -e CONFIG_CAN_C_CAN -e CONFIG_CAN_C_CAN_PLATFORM -e CONFIG_CAN_C_CAN_PCI \
@@ -228,38 +211,25 @@ jobs:
             -e CONFIG_CAN_HI311X -e CONFIG_CAN_MCP251X \
             -e CONFIG_CAN_8DEV_USB -e CONFIG_CAN_EMS_USB -e CONFIG_CAN_ESD_USB2 \
             -e CONFIG_CAN_GS_USB -e CONFIG_CAN_KVASER_USB -e CONFIG_CAN_PEAK_USB \
-            -e CONFIG_NETLINK_DIAG -e CONFIG_VSOCKETS -e CONFIG_NET_SCHED -e CONFIG_NET_EMATCH_CANID
-
-          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_NETLINK_DIAG -e CONFIG_VSOCKETS -e CONFIG_NET_SCHED -e CONFIG_NET_EMATCH_CANID \
             -e CONFIG_USB_SERIAL -e CONFIG_USB_SERIAL_CONSOLE -e CONFIG_USB_SERIAL_GENERIC \
-            -e CONFIG_USB_SERIAL_CH341 -e CONFIG_USB_SERIAL_FTDI_SIO -e CONFIG_USB_SERIAL_PL2303
-
-          ./scripts/config --file "$OUT/.config" \
-            -e CONFIG_IP_NF_TARGET_TTL -e CONFIG_IP6_NF_TARGET_HL -e CONFIG_IP6_NF_MATCH_HL
-
-          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_USB_SERIAL_CH341 -e CONFIG_USB_SERIAL_FTDI_SIO -e CONFIG_USB_SERIAL_PL2303 \
+            -e CONFIG_IP_NF_TARGET_TTL -e CONFIG_IP6_NF_TARGET_HL -e CONFIG_IP6_NF_MATCH_HL \
             -e CONFIG_IP_SET --set-val CONFIG_IP_SET_MAX 65534 \
             -e CONFIG_IP_SET_BITMAP_IP -e CONFIG_IP_SET_BITMAP_IPMAC -e CONFIG_IP_SET_BITMAP_PORT \
             -e CONFIG_IP_SET_HASH_IP -e CONFIG_IP_SET_HASH_IPMARK -e CONFIG_IP_SET_HASH_IPPORT \
             -e CONFIG_IP_SET_HASH_IPPORTIP -e CONFIG_IP_SET_HASH_IPPORTNET -e CONFIG_IP_SET_HASH_IPMAC \
             -e CONFIG_IP_SET_HASH_MAC -e CONFIG_IP_SET_HASH_NETPORTNET -e CONFIG_IP_SET_HASH_NET \
             -e CONFIG_IP_SET_HASH_NETNET -e CONFIG_IP_SET_HASH_NETPORT -e CONFIG_IP_SET_HASH_NETIFACE \
-            -e CONFIG_IP_SET_LIST_SET
-
-          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_IP_SET_LIST_SET \
             -e CONFIG_NET_SCH_FQ -e CONFIG_NET_SCH_FQ_CODEL -e CONFIG_NET_SCH_CAKE \
-            -e CONFIG_NET_SCH_PIE -e CONFIG_NET_SCH_FQ_PIE
-
-          ./scripts/config --file "$OUT/.config" \
-            -e CONFIG_SYSVIPC -e CONFIG_POSIX_MQUEUE -e CONFIG_PID_NS -e CONFIG_IPC_NS -e CONFIG_USER_NS
-
-          ./scripts/config --file "$OUT/.config" \
+            -e CONFIG_NET_SCH_PIE -e CONFIG_NET_SCH_FQ_PIE \
+            -e CONFIG_SYSVIPC -e CONFIG_POSIX_MQUEUE -e CONFIG_PID_NS -e CONFIG_IPC_NS -e CONFIG_USER_NS \
             -e CONFIG_DEVTMPFS -e CONFIG_NETFILTER_XT_MATCH_ADDRTYPE \
             -e CONFIG_NETFILTER_XT_SET -e CONFIG_NETFILTER_XT_TARGET_REJECT \
             -e CONFIG_NETFILTER_XT_TARGET_LOG -e CONFIG_NETFILTER_XT_MATCH_RECENT
           echo "::endgroup::"
 
-          # --- RTW88 MODULES ---
           echo "::group::Adding rtw88 modules"
           cd "$ROOT/drivers/net/wireless/realtek/"
           rm -rf rtw88
@@ -271,7 +241,6 @@ jobs:
 
           set +u
           if declare -f compile_system_dlkm_modules > /dev/null; then
-            echo "Executing compile_system_dlkm_modules from build.config..."
             compile_system_dlkm_modules
           fi
           set -u
@@ -279,9 +248,7 @@ jobs:
           make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
           if [[ -f "$MTIME_CACHE" ]]; then
-            echo "::group::Find changes force recompilation (-u)"
             "$MTIME_CACHE" -u -d "$ROOT" -k kernel
-            echo "::endgroup::"
           fi
 
           K_MAKE_FLAGS=("-j$(nproc --all)" "O=$OUT" "ARCH=arm64" "LLVM=1" "LLVM_IAS=1" "CC=ccache clang" "HOSTCC=ccache clang" "HOSTCXX=ccache clang++" "KCFLAGS=$WARN_FLAGS")
@@ -358,7 +325,6 @@ jobs:
           echo "extfs_rsv_pct=0" >> "$system_dlkm_props_file"
           echo "journal_size=0" >> "$system_dlkm_props_file"
 
-          echo "Building system_dlkm with build_image..."
           build_image "$SYS_STAGE" "$system_dlkm_props_file" "$DIST/system_dlkm.img" /dev/null
           avbtool add_hashtree_footer --partition_name system_dlkm --hash_algorithm sha256 --image "$DIST/system_dlkm.img" --do_not_generate_fec
 
@@ -380,7 +346,6 @@ jobs:
           echo "ext_mkuserimg=mkuserimg_mke2fs" >> "$vendor_dlkm_props_file"
           echo "ext4_share_dup_blocks=true" >> "$vendor_dlkm_props_file"
 
-          echo "Building vendor_dlkm with build_image..."
           build_image "$VEND_STAGE" "$vendor_dlkm_props_file" "$DIST/vendor_dlkm.img" /dev/null
           avbtool add_hashtree_footer --partition_name vendor_dlkm --hash_algorithm sha256 --image "$DIST/vendor_dlkm.img" --do_not_generate_fec
           echo "::endgroup::"
@@ -404,8 +369,15 @@ jobs:
             
             EXT_MOD_REL=$(realpath -s --relative-to="$ROOT" "$TARGET_DIR")
             
-            # FIX: Force include linux/stringify.h for securemsm-kernel
-            EXTRA_CFLAGS="$WARN_FLAGS -include linux/stringify.h"
+            # Fix for securemsm-kernel __stringify issue
+            if [[ "$EXT_MOD_ACTUAL" == *"securemsm-kernel"* ]]; then
+              echo "Patching trace_smcinvoke.h for securemsm-kernel..."
+              if [[ -f "$TARGET_DIR/smcinvoke/compat/trace_smcinvoke.h" ]]; then
+                sed -i 's/__stringify(\(.*\))/\1/g' "$TARGET_DIR/smcinvoke/compat/trace_smcinvoke.h" || true
+              fi
+            fi
+            
+            EXTRA_CFLAGS="$WARN_FLAGS -include linux/stringify.h -I$ROOT/include -I$ROOT/arch/arm64/include"
             
             if [[ "$EXT_MOD_ACTUAL" == *"qcacld-3.0"* ]]; then
               echo "Applying monitor mode configs to WLAN..."
