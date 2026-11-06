@@ -127,7 +127,6 @@ jobs:
           DYNAMIC_CACHE_DIR="$OUT/dynamic_cache"
           JOBS="$(nproc --all)"
 
-          # Check if we are compiling DLKMs/Boot images (defaults to true on push)
           BUILD_IMAGES="${{ inputs.compile_dlkm }}"
           if [[ "${{ github.event_name }}" == "push" ]]; then BUILD_IMAGES="true"; fi
 
@@ -144,6 +143,10 @@ jobs:
           export OS_SHORT="los23.2"
           export QCACLD_DEV_NAME="qca6750"
           export DYNAMIC_CACHE_DIR="$DYNAMIC_CACHE_DIR"
+          
+          # Crucial for Qualcomm modules to find the right configs
+          export TARGET_BOARD_PLATFORM="${SOC}"
+          export BOARD_PLATFORM="${SOC}"
 
           WARN_FLAGS="-Wno-error -Wno-gnu-zero-variadic-macro-arguments -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-format"
 
@@ -211,16 +214,13 @@ jobs:
             -e CFG80211_REQUIRE_SIGNED_REGDB -e CFG80211_USE_KERNEL_REGDB_KEYS \
             -e CFG80211_DEFAULT_PS -d CFG80211_CRDA_SUPPORT -d CFG80211_WEXT -m MAC80211
 
-          # NetHunter: Bluetooth
           ./scripts/config --file "$OUT/.config" \
             -e CONFIG_BT_HCIBTUSB -e CONFIG_BT_HCIBTUSB_BCM -e CONFIG_BT_HCIBTUSB_RTL \
             -e CONFIG_BT_HCIVHCI -e CONFIG_BT_HCIBCM203X -e CONFIG_BT_HCIBPA10X -e CONFIG_BT_HCIBFUSB
 
-          # NetHunter: Airspy & HackRF
           ./scripts/config --file "$OUT/.config" \
             -e CONFIG_USB_AIRSPY -e CONFIG_USB_HACKRF
 
-          # NetHunter: CAN
           ./scripts/config --file "$OUT/.config" \
             -e CONFIG_CAN -e CONFIG_CAN_DEV -e CONFIG_CAN_CALC_BITTIMING -e CONFIG_CAN_LEDS \
             -e CONFIG_CAN_VCAN -e CONFIG_CAN_GRCAN -e CONFIG_CAN_XILINXCAN \
@@ -232,16 +232,13 @@ jobs:
             -e CONFIG_CAN_GS_USB -e CONFIG_CAN_KVASER_USB -e CONFIG_CAN_PEAK_USB \
             -e CONFIG_NETLINK_DIAG -e CONFIG_VSOCKETS -e CONFIG_NET_SCHED -e CONFIG_NET_EMATCH_CANID
 
-          # NetHunter: USB Serial
           ./scripts/config --file "$OUT/.config" \
             -e CONFIG_USB_SERIAL -e CONFIG_USB_SERIAL_CONSOLE -e CONFIG_USB_SERIAL_GENERIC \
             -e CONFIG_USB_SERIAL_CH341 -e CONFIG_USB_SERIAL_FTDI_SIO -e CONFIG_USB_SERIAL_PL2303
 
-          # TTL Target Support
           ./scripts/config --file "$OUT/.config" \
             -e CONFIG_IP_NF_TARGET_TTL -e CONFIG_IP6_NF_TARGET_HL -e CONFIG_IP6_NF_MATCH_HL
 
-          # IP SET Support
           ./scripts/config --file "$OUT/.config" \
             -e CONFIG_IP_SET --set-val CONFIG_IP_SET_MAX 65534 \
             -e CONFIG_IP_SET_BITMAP_IP -e CONFIG_IP_SET_BITMAP_IPMAC -e CONFIG_IP_SET_BITMAP_PORT \
@@ -251,16 +248,13 @@ jobs:
             -e CONFIG_IP_SET_HASH_NETNET -e CONFIG_IP_SET_HASH_NETPORT -e CONFIG_IP_SET_HASH_NETIFACE \
             -e CONFIG_IP_SET_LIST_SET
 
-          # Traffic Schedulers (qdisc)
           ./scripts/config --file "$OUT/.config" \
             -e CONFIG_NET_SCH_FQ -e CONFIG_NET_SCH_FQ_CODEL -e CONFIG_NET_SCH_CAKE \
             -e CONFIG_NET_SCH_PIE -e CONFIG_NET_SCH_FQ_PIE
 
-          # SYSVIPC & Namespaces (Droidspaces)
           ./scripts/config --file "$OUT/.config" \
             -e CONFIG_SYSVIPC -e CONFIG_POSIX_MQUEUE -e CONFIG_PID_NS -e CONFIG_IPC_NS -e CONFIG_USER_NS
 
-          # Other misc configs
           ./scripts/config --file "$OUT/.config" \
             -e CONFIG_DEVTMPFS -e CONFIG_NETFILTER_XT_MATCH_ADDRTYPE \
             -e CONFIG_NETFILTER_XT_SET -e CONFIG_NETFILTER_XT_TARGET_REJECT \
@@ -373,16 +367,22 @@ jobs:
             EXTRA_SYMBOLS=""
 
             for EXT_MOD in "${EXT_MODULES[@]}"; do
-              CLEAN_PATH="${EXT_MOD#../vendor/}"
-              TARGET_DIR="$GITHUB_WORKSPACE/modules_src/$CLEAN_PATH"
+              # Handle the hidden folder .qca6750 in the build config
+              if [[ "$EXT_MOD" == *"qcacld-3.0"* ]]; then
+                TARGET_DIR="$GITHUB_WORKSPACE/modules_src/qcom/opensource/wlan/qcacld-3.0"
+                EXT_MOD_REL="../../vendor/qcom/opensource/wlan/qcacld-3.0"
+              else
+                CLEAN_PATH="${EXT_MOD#../vendor/}"
+                TARGET_DIR="$GITHUB_WORKSPACE/modules_src/$CLEAN_PATH"
+                EXT_MOD_REL="../../vendor/$CLEAN_PATH"
+              fi
               
               if [[ ! -d "$TARGET_DIR" ]]; then
-                echo "WARNING: $CLEAN_PATH not found in modules_src, skipping."
+                echo "WARNING: $TARGET_DIR not found in modules_src, skipping."
                 continue
               fi
               
-              echo "Building $CLEAN_PATH..."
-              REL_PATH=$(realpath -s --relative-to="$ROOT" "$TARGET_DIR")
+              echo "Building $TARGET_DIR..."
               
               if [[ "$EXT_MOD" == *"qcacld-3.0"* ]]; then
                 echo "Applying monitor mode configs to WLAN..."
@@ -391,10 +391,11 @@ jobs:
                   [[ -f "$dcfg" ]] && { sed -i '/CONFIG_FEATURE_MONITOR_MODE_SUPPORT/d' "$dcfg"; echo "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y" >> "$dcfg"; }
                 done
 
+                # Pass ONLY the extra symvers collected so far
                 export KBUILD_EXTRA_SYMBOLS="$EXTRA_SYMBOLS"
 
-                make -j"$JOBS" -C "$ROOT" O="$OUT" \
-                  M="$TARGET_DIR" \
+                # Notice we use -C "$TARGET_DIR" here to run from the module directory
+                make -j"$JOBS" -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
                   ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
                   WLAN_ROOT="$TARGET_DIR" WLAN_COMMON_ROOT=cmn WLAN_COMMON_INC="$TARGET_DIR/cmn" \
                   WLAN_FW_API="$TARGET_DIR/../fw-api/" CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
@@ -407,18 +408,20 @@ jobs:
 
                 llvm-strip --strip-debug "$TARGET_DIR/qca_cld3_qca6750.ko"
               else
-                make -j"$JOBS" -C "$ROOT" O="$OUT" M="$REL_PATH" \
+                # Notice we use -C "$TARGET_DIR" here to run from the module directory
+                make -j"$JOBS" -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
                   ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
                   CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
                   KCFLAGS="$WARN_FLAGS" \
                   modules
                   
-                make -j"$JOBS" -C "$ROOT" O="$OUT" M="$REL_PATH" \
+                make -j"$JOBS" -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
                   ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
                   INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_DIR="extra/$CLEAN_PATH" \
                   modules_install
               fi
 
+              # Collect the symvers generated by this module for the next ones
               if [[ -f "$TARGET_DIR/Module.symvers" ]]; then
                 EXTRA_SYMBOLS+=" $TARGET_DIR/Module.symvers"
               fi
@@ -473,24 +476,50 @@ jobs:
           STAGE="$(mktemp -d)"
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$STAGE"
           rm -rf "$STAGE/.git"
-          sed -i 's/device.name1=.*/device.name1=peridot/g; s/device.name2=.*/device.name2=pineapple/g; s/BLOCK=.*/BLOCK=auto;/g; s/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=1;/g' "$STAGE/anykernel.sh"
+
+          # Safely write anykernel.sh without YAML heredoc issues
+          echo '#!/sbin/sh' > "$STAGE/anykernel.sh"
+          echo 'properties() { ' >> "$STAGE/anykernel.sh"
+          echo 'kernel.string=Lucy-Monitor' >> "$STAGE/anykernel.sh"
+          echo 'do.devicecheck=1' >> "$STAGE/anykernel.sh"
+          echo 'do.modules=0' >> "$STAGE/anykernel.sh"
+          echo 'do.systemless=1' >> "$STAGE/anykernel.sh"
+          echo 'do.cleanup=1' >> "$STAGE/anykernel.sh"
+          echo 'do.cleanuponabort=0' >> "$STAGE/anykernel.sh"
+          echo 'device.name1=peridot' >> "$STAGE/anykernel.sh"
+          echo 'device.name2=pineapple' >> "$STAGE/anykernel.sh"
+          echo 'device.name3=' >> "$STAGE/anykernel.sh"
+          echo 'device.name4=' >> "$STAGE/anykernel.sh"
+          echo 'device.name5=' >> "$STAGE/anykernel.sh"
+          echo 'supported.versions=' >> "$STAGE/anykernel.sh"
+          echo 'supported.patchlevels=' >> "$STAGE/anykernel.sh"
+          echo '}; # end properties' >> "$STAGE/anykernel.sh"
+          echo '' >> "$STAGE/anykernel.sh"
+          echo '## AnyKernel methods (DO NOT CHANGE)' >> "$STAGE/anykernel.sh"
+          echo '. $AKHOME/tools/ak3-core.sh' >> "$STAGE/anykernel.sh"
+          echo '' >> "$STAGE/anykernel.sh"
+          echo '## AnyKernel install' >> "$STAGE/anykernel.sh"
+          echo 'dump_boot' >> "$STAGE/anykernel.sh"
+          echo '' >> "$STAGE/anykernel.sh"
+          echo '# Lucy WLAN module injection' >> "$STAGE/anykernel.sh"
+          echo 'if [ -f "$AKHOME/qca_cld3_qca6750.ko" ]; then' >> "$STAGE/anykernel.sh"
+          echo '    for Lucy_tgt in /vendor_dlkm/lib/modules/qca_cld3_qca6750.ko /vendor/lib/modules/qca_cld3_qca6750.ko; do' >> "$STAGE/anykernel.sh"
+          echo '        Lucy_tdir=$(dirname "$Lucy_tgt")' >> "$STAGE/anykernel.sh"
+          echo '        if [ -d "$Lucy_tdir" ]; then' >> "$STAGE/anykernel.sh"
+          echo '            mount -o rw,remount "$(echo "$Lucy_tgt" | cut -d/ -f1-2)" 2>/dev/null || true' >> "$STAGE/anykernel.sh"
+          echo '            cp -f "$AKHOME/qca_cld3_qca6750.ko" "$Lucy_tgt" 2>/dev/null && \' >> "$STAGE/anykernel.sh"
+          echo '            { chmod 644 "$Lucy_tgt"; chown 0:0 "$Lucy_tgt"; restorecon "$Lucy_tgt" 2>/dev/null; break; }' >> "$STAGE/anykernel.sh"
+          echo '        fi' >> "$STAGE/anykernel.sh"
+          echo '    done' >> "$STAGE/anykernel.sh"
+          echo 'fi' >> "$STAGE/anykernel.sh"
+          echo '' >> "$STAGE/anykernel.sh"
+          echo 'write_boot' >> "$STAGE/anykernel.sh"
 
           cp -f "$OUT/arch/arm64/boot/Image" "$STAGE/Image"
           
           WLAN_MOD_PATH="$GITHUB_WORKSPACE/modules_src/qcom/opensource/wlan/qcacld-3.0/qca_cld3_qca6750.ko"
           if [[ -f "$WLAN_MOD_PATH" ]]; then
             cp -f "$WLAN_MOD_PATH" "$STAGE/"
-            
-            echo 'if [ -f "$AKHOME/qca_cld3_qca6750.ko" ]; then' >> "$STAGE/anykernel.sh"
-            echo '    for Lucy_tgt in /vendor_dlkm/lib/modules/qca_cld3_qca6750.ko /vendor/lib/modules/qca_cld3_qca6750.ko; do' >> "$STAGE/anykernel.sh"
-            echo '        Lucy_tdir=$(dirname "$Lucy_tgt")' >> "$STAGE/anykernel.sh"
-            echo '        if [ -d "$Lucy_tdir" ]; then' >> "$STAGE/anykernel.sh"
-            echo '            mount -o rw,remount "$(echo "$Lucy_tgt" | cut -d/ -f1-2)" 2>/dev/null || true' >> "$STAGE/anykernel.sh"
-            echo '            cp -f "$AKHOME/qca_cld3_qca6750.ko" "$Lucy_tgt" 2>/dev/null && \' >> "$STAGE/anykernel.sh"
-            echo '            { chmod 644 "$Lucy_tgt"; chown 0:0 "$Lucy_tgt"; restorecon "$Lucy_tgt" 2>/dev/null; break; }' >> "$STAGE/anykernel.sh"
-            echo '        fi' >> "$STAGE/anykernel.sh"
-            echo '    done' >> "$STAGE/anykernel.sh"
-            echo 'fi' >> "$STAGE/anykernel.sh"
           fi
 
           (cd "$STAGE" && zip -r9q "$DIST/Lucy-Monitor-${FLAVOR}-$(date -u +%Y%m%d)-$(cd "$ROOT" && git rev-parse --short=7 HEAD).zip" .)
