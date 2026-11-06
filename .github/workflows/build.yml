@@ -16,6 +16,18 @@ on:
         required: true
         type: string
         default: 'lineage-23.2'
+      clang_version:
+        description: "Select Compiler version"
+        required: true
+        type: choice
+        options:
+          - manifest
+          - aosp-clang-3289846
+          - aosp-clang-r547379
+          - aosp-clang-r563880
+          - aosp-clang-r563880c
+          - aosp-clang-r574158
+        default: 'aosp-clang-r563880c'
       compile_dlkm:
         description: 'Build DLKMs, Modules & Boot Images (Uncheck for Kernel Image Only)'
         required: true
@@ -29,7 +41,7 @@ on:
           - none
           - Pre-release
           - Release
-        default: none
+        default: 'Pre-release'
 
 permissions:
   contents: write
@@ -43,6 +55,7 @@ env:
   CACHE_KEY_STATIC: cache-Lucy-peridot-v1
   KERNEL_REPO: ${{ inputs.kernel_repo || 'https://github.com/Harshit-2077/android_kernel_xiaomeme_sm8635.git' }}
   KERNEL_BRANCH: ${{ inputs.kernel_branch || 'lineage-23.2' }}
+  CLANG_INPUT: ${{ inputs.clang_version || 'aosp-clang-r574158' }}
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   
   # Global Paths (Available to all steps)
@@ -106,19 +119,6 @@ jobs:
           curl -sL https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT | base64 -d | sudo tee /usr/local/bin/avbtool > /dev/null
           sudo chmod +x /usr/local/bin/avbtool
 
-      - name: Setup Neutron Clang Toolchain (v23)
-        run: |
-          mkdir -p "$HOME/clang"
-          cd "$HOME/clang"
-          curl -sL "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman" -o antman
-          chmod +x antman
-          # Sync a specific Clang 23 release tag
-          ./antman -S=23052026
-          ./antman --patch=glibc
-          
-          echo "CLANG_DIR=$HOME/clang" >> "$GITHUB_ENV"
-          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
-
       - name: Clone Kernel Source & Kernel Kit
         run: |
           echo "Cloning kernel source from $KERNEL_REPO ($KERNEL_BRANCH)..."
@@ -131,6 +131,57 @@ jobs:
           git clone --depth=1 --branch lineage-23.2 "https://github.com/Harshit-2077/android_kernel_xiaomi_sm8635-modules.git" "$GITHUB_WORKSPACE/modules_src"
           
           ln -sfn "$GITHUB_WORKSPACE/modules_src" "$GITHUB_WORKSPACE/vendor"
+
+      - name: Download Clang (toolchain for build)
+        if: env.CLANG_INPUT != 'manifest'
+        uses: nullptr-t-oss/kernel_toolchains/clang_setup@main
+        with:
+          clang-version: '${{ env.CLANG_INPUT }}'
+          install-dir: '${{ github.workspace }}/kernel_src/prebuilts/clang/host/linux-x86'
+
+      - name: Detect Clang (toolchain for build)
+        if: env.CLANG_INPUT == 'manifest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Detecting Clang..."
+          CLANG_FOUND=false
+          for base in "${ROOT}/prebuilts" "${ROOT}/prebuilts-master"; do
+            [ -d "${base}/clang/host/linux-x86" ] || continue
+
+            latest=$(ls -d "$base"/clang/host/linux-x86/clang-r*/ 2>/dev/null | sort -V | tail -n1 || true)
+            if [ -n "${latest}" ] && [ -x "${latest}/bin/clang" ]; then
+              CLANG_BIN="${latest}/bin"
+              CLANG_FOUND=true
+            fi
+          done
+          if ! ${CLANG_FOUND} && command -v clang >/dev/null 2>&1; then
+            CLANG_BIN="$(dirname "$(command -v clang)")"
+            CLANG_FOUND=true
+            echo "Using system clang."
+          fi
+          ${CLANG_FOUND} || { echo "No clang toolchain found"; exit 1; }
+          echo "${CLANG_BIN}" >> "${GITHUB_PATH}"
+          CLANG_VERSION="$("${CLANG_BIN}/clang" --version | head -n1)"
+          echo "CLANG_VERSION=${CLANG_VERSION}" >> "${GITHUB_ENV}"
+          echo "[NOTICE] Using clang : ${CLANG_VERSION}"
+          echo "Clang detected ✅"
+          echo "::endgroup::"
+
+      - name: Export Downloaded Clang to Path
+        if: env.CLANG_INPUT != 'manifest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLANG_BIN=$(find "${{ github.workspace }}/kernel_src/prebuilts/clang/host/linux-x86" -maxdepth 2 -type d -name "bin" | head -n 1)
+          if [ -z "$CLANG_BIN" ]; then
+            echo "::error::Clang toolchain not found!"
+            exit 1
+          fi
+          echo "CLANG_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
+          echo "$CLANG_BIN" >> "$GITHUB_PATH"
+          echo "Using clang: $CLANG_BIN"
+          $CLANG_BIN/clang --version
 
       - name: Restore Build Cache
         uses: actions/cache/restore@v4
