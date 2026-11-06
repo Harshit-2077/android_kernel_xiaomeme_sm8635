@@ -362,6 +362,7 @@ jobs:
             HOSTCXX="ccache clang++"
             CC="ccache clang"
             KERNEL_SRC="$ROOT"
+            KCFLAGS="$WARN_FLAGS"
           )
 
           EXTRA_SYMBOLS=""
