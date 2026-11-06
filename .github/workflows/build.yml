@@ -49,7 +49,7 @@ env:
   FLAVOR: "Lucy-monitor"
   ROOT: "${{ github.workspace }}/kernel_src"
   ROOT_DIR: "${{ github.workspace }}/kernel_src"
-  KERNEL_DIR: "."  # FIX: Tells build.config the kernel is at the root
+  KERNEL_DIR: "."  # Tells build.config the kernel is at the root
   OUT: "${{ github.workspace }}/out"
   DIST: "${{ github.workspace }}/dist"
   DYNAMIC_CACHE_DIR: "${{ github.workspace }}/out/dynamic_cache"
@@ -114,7 +114,10 @@ jobs:
           chmod +x antman
           ./antman -S
           ./antman --patch=glibc
+          
+          # Fix: Add clang to GITHUB_PATH so ALL subsequent steps use it
           echo "CLANG_DIR=$HOME/clang" >> "$GITHUB_ENV"
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
 
       - name: Clone Kernel Source & Kernel Kit
         run: |
@@ -142,7 +145,6 @@ jobs:
           set -euo pipefail
           mkdir -p "$OUT" "$DIST" "$DYNAMIC_CACHE_DIR"
 
-          export PATH="$CLANG_DIR/bin:$PATH"
           export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
           export KBUILD_BUILD_USER="Harshit-2077" KBUILD_BUILD_HOST="Lucy"
           
@@ -390,17 +392,19 @@ jobs:
           for EXT_MOD in "${EXT_MODULES[@]}"; do
             EXT_MOD_ACTUAL=$(echo "$EXT_MOD" | sed "s/\.\${QCACLD_DEV_NAME}/.qca6750/")
             
-            # Check if directory exists in our symlinked vendor tree
-            if [[ ! -d "$ROOT/$EXT_MOD_ACTUAL" ]]; then
-              echo "WARNING: The following module path does not exist : $EXT_MOD_ACTUAL" >&2
+            CLEAN_PATH="${EXT_MOD_ACTUAL#../}"
+            TARGET_DIR="$GITHUB_WORKSPACE/$CLEAN_PATH"
+            
+            if [[ ! -d "$TARGET_DIR" ]]; then
+              echo "WARNING: The following module path does not exist : $TARGET_DIR" >&2
               continue
             fi
             
             echo "Building $EXT_MOD_ACTUAL..."
             
+            EXT_MOD_REL=$(realpath -s --relative-to="$ROOT" "$TARGET_DIR")
+            
             if [[ "$EXT_MOD_ACTUAL" == *"qcacld-3.0"* ]]; then
-              # WLAN Module
-              TARGET_DIR="$ROOT/$EXT_MOD_ACTUAL"
               echo "Applying monitor mode configs to WLAN..."
               ln -sfn ../qca-wifi-host-cmn "$TARGET_DIR/cmn"
               for dcfg in "$TARGET_DIR/configs/"*qca6750* "$TARGET_DIR/configs/default_defconfig"; do
@@ -409,8 +413,9 @@ jobs:
 
               export KBUILD_EXTRA_SYMBOLS="$EXTRA_SYMBOLS"
 
-              make -j$(nproc --all) -C "$ROOT" O="$OUT" M="$EXT_MOD_ACTUAL" \
+              make -j$(nproc --all) -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
                 ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
+                KERNEL_SRC="$ROOT" \
                 WLAN_ROOT="$TARGET_DIR" WLAN_COMMON_ROOT=cmn WLAN_COMMON_INC="$TARGET_DIR/cmn" \
                 WLAN_FW_API="$TARGET_DIR/../fw-api/" CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
                 CONFIG_CNSS_OUT_OF_TREE=y CONFIG_IPA_OUT_OF_TREE=y CONFIG_QCA_WIFI_ISOC=0 \
@@ -422,23 +427,20 @@ jobs:
 
               llvm-strip --strip-debug "$TARGET_DIR/qca_cld3_qca6750.ko"
             else
-              # Other Modules
-              CLEAN_PATH=$(echo "$EXT_MOD_ACTUAL" | sed 's|^\.\./vendor/||')
-              
-              make -j$(nproc --all) -C "$ROOT" O="$OUT" M="$EXT_MOD_ACTUAL" \
+              make -j$(nproc --all) -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
                 ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
-                CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
+                KERNEL_SRC="$ROOT" CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
                 KCFLAGS="$WARN_FLAGS" \
                 modules
                 
-              make -j$(nproc --all) -C "$ROOT" O="$OUT" M="$EXT_MOD_ACTUAL" \
+              make -j$(nproc --all) -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
                 ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
-                INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_DIR="extra/$CLEAN_PATH" \
+                KERNEL_SRC="$ROOT" INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_DIR="extra/$CLEAN_PATH" \
                 modules_install
             fi
 
-            if [[ -f "$ROOT/$EXT_MOD_ACTUAL/Module.symvers" ]]; then
-              EXTRA_SYMBOLS+=" $ROOT/$EXT_MOD_ACTUAL/Module.symvers"
+            if [[ -f "$TARGET_DIR/Module.symvers" ]]; then
+              EXTRA_SYMBOLS+=" $TARGET_DIR/Module.symvers"
             fi
           done
           echo "::endgroup::"
@@ -447,7 +449,7 @@ jobs:
           VB_RAMDISK_DIR="$OUT/vendor_boot_ramdisk"
           mkdir -p "$VB_RAMDISK_DIR/lib/modules/$UNAME"
           
-          WLAN_MOD_PATH="$ROOT/../vendor/qcom/opensource/wlan/qcacld-3.0/qca_cld3_qca6750.ko"
+          WLAN_MOD_PATH="$GITHUB_WORKSPACE/vendor/qcom/opensource/wlan/qcacld-3.0/qca_cld3_qca6750.ko"
           if [[ -f "$WLAN_MOD_PATH" ]]; then
             cp "$WLAN_MOD_PATH" "$VB_RAMDISK_DIR/lib/modules/$UNAME/"
           fi
@@ -534,7 +536,7 @@ jobs:
 
           cp -f "$OUT/arch/arm64/boot/Image" "$STAGE/Image"
           
-          WLAN_MOD_PATH="$ROOT/../vendor/qcom/opensource/wlan/qcacld-3.0/qca_cld3_qca6750.ko"
+          WLAN_MOD_PATH="$GITHUB_WORKSPACE/vendor/qcom/opensource/wlan/qcacld-3.0/qca_cld3_qca6750.ko"
           if [[ -f "$WLAN_MOD_PATH" ]]; then
             cp -f "$WLAN_MOD_PATH" "$STAGE/"
           fi
