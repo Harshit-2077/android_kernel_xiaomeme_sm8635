@@ -23,6 +23,14 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Cache key for the build. Bump the 'v1' if you change toolchains or make major config changes.
+  CACHE_KEY: cache-Lucy-peridot-${{ github.sha }} 
+  # Actually, using commit SHA means a new cache every push. Better to use a static key:
+  CACHE_KEY_STATIC: cache-Lucy-peridot-v1
+  OUT_DIR: ${{ github.workspace }}/out
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -55,12 +63,6 @@ jobs:
           curl -sL https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT | base64 -d | sudo tee /usr/local/bin/avbtool > /dev/null
           sudo chmod +x /usr/local/bin/avbtool
 
-      - name: Setup ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: Lucy-sm8635-ccache-v1
-          max-size: 2G
-
       - name: Setup Neutron Clang Toolchain
         run: |
           mkdir -p "$HOME/clang"
@@ -75,6 +77,12 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/Harshit-2077/kernel_kit.git "$GITHUB_WORKSPACE/kernel_kit"
           echo "KERNEL_KIT=$GITHUB_WORKSPACE/kernel_kit" >> "$GITHUB_ENV"
+
+      - name: Restore Build Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.OUT_DIR }}
+          key: ${{ env.CACHE_KEY_STATIC }}
 
       - name: Build Kernel, DLKMs & Images
         shell: bash
@@ -94,10 +102,17 @@ jobs:
           export SOC="cliffs"
           export CODENAME="peridot"
           export OS_SHORT="los23.2"
+          export QCACLD_DEV_NAME="qca6750"
 
           OUT="$ROOT/out"; DIST="$ROOT/dist"; JOBS="$(nproc --all)"
-          rm -rf "$OUT" "$DIST"; mkdir -p "$OUT" "$DIST"
+          rm -rf "$DIST"; mkdir -p "$OUT" "$DIST"
           WARN_FLAGS="-Wno-error -Wno-gnu-zero-variadic-macro-arguments -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-format"
+
+          # Setup ccache inside OUT_DIR so it gets cached along with build artifacts
+          export CCACHE_DIR="$OUT/ccache"
+          mkdir -p "$CCACHE_DIR"
+          ccache -o compression=false
+          ccache -M 5G
 
           echo "::group::0. Fix OpenSSL 3.0 key_pass"
           if [[ -f "$ROOT/certs/extract-cert.c" ]]; then
@@ -108,13 +123,25 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::1. Defconfig & Compile"
+          
+          MTIME_CACHE="$KERNEL_KIT/scripts/dynamic_mtime.sh"
+          if [[ -f "$MTIME_CACHE" ]]; then
+            chmod +x "$MTIME_CACHE"
+            echo "::group::Restore File Timestamps (-t)"
+            # Touch files to restore their state from cache
+            "$MTIME_CACHE" -t -d "$ROOT" -k kernel
+            echo "::endgroup::"
+          fi
+
           # Source the build.config from kernel_kit
           BUILD_CONFIG="$KERNEL_KIT/device/peridot-los23.2/build_config/build.config.peridot.los23.2"
           if [[ -f "$BUILD_CONFIG" ]]; then
             echo "Sourcing build config: $BUILD_CONFIG"
+            set +u
             set -a
             source "$BUILD_CONFIG"
             set +a
+            set -u
           else
             echo "::error::build.config not found!"
             exit 1
@@ -147,6 +174,13 @@ jobs:
           fi
           
           make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+
+          if [[ -f "$MTIME_CACHE" ]]; then
+            echo "::group::Find changes force recompilation (-u)"
+            # Update timestamps for changed files so make only compiles what's new
+            "$MTIME_CACHE" -u -d "$ROOT" -k kernel
+            echo "::endgroup::"
+          fi
 
           # Use MAKE_FLAGS if defined in build.config
           K_MAKE_FLAGS=("-j$JOBS" "O=$OUT" "ARCH=arm64" "LLVM=1" "LLVM_IAS=1" "CC=ccache clang" "HOSTCC=ccache clang" "HOSTCXX=ccache clang++" "KBUILD_MODPOST_WARN=1" "KCFLAGS=$WARN_FLAGS")
@@ -292,6 +326,19 @@ jobs:
           mkdir -p dist
           curl -sL -o dist/nethunter-wireless-firmware.zip "https://github.com/Magisk-Modules-Repo/wirelessFirmware/releases/latest/download/wirelessFirmware.zip" || \
           curl -sL -o dist/nethunter-wireless-firmware.zip "https://github.com/rithvikvibhu/nh-magisk-wifi-firmware/archive/refs/heads/master.zip"
+
+      - name: Delete Old Build Cache
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh cache delete "${{ env.CACHE_KEY_STATIC }}" || true
+
+      - name: Save New Build Cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.OUT_DIR }}
+          key: ${{ env.CACHE_KEY_STATIC }}
 
       - name: Upload Build Artifacts (Workflow Run)
         uses: actions/upload-artifact@v4
