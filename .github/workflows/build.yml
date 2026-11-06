@@ -382,6 +382,12 @@ jobs:
             echo "Building $EXT_MOD_ACTUAL..."
             
             EXT_MOD_REL=$(realpath -s --relative-to="$ROOT" "$ROOT/$EXT_MOD_ACTUAL")
+
+            # Per-module extra include paths (absolute: the compiler runs from $OUT, not the module dir)
+            MOD_INC=""
+            if [[ "$EXT_MOD_ACTUAL" == *"audio-kernel"* ]]; then
+              MOD_INC="-I$(realpath "$ROOT/$EXT_MOD_ACTUAL")/include"
+            fi
             
             # Patch securemsm-kernel specifically to remove -Werror and stringify issues
             if [[ "$EXT_MOD_ACTUAL" == *"securemsm-kernel"* ]]; then
@@ -423,7 +429,9 @@ jobs:
               llvm-strip --strip-debug "$TARGET_DIR/qca_cld3_qca6750.ko"
             else
               # Using EXACTLY their MAKE_FLAGS logic
-              make -C "$EXT_MOD_REL" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT"
+              make -C "$EXT_MOD_REL" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT" \
+                KCFLAGS="-Wno-error -include linux/stringify.h $MOD_INC" \
+                EXTRA_CFLAGS="-Wno-error -include linux/stringify.h $MOD_INC"
               make -C "$EXT_MOD_REL" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT" INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_DIR="extra/$EXT_MOD_ACTUAL" modules_install
             fi
 
