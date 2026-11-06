@@ -352,34 +352,33 @@ jobs:
 
           echo "::group::3. Compile External Modules (Following build.config order)"
           
+          MAKE_FLAGS=(
+            -j$(nproc --all)
+            LLVM=1
+            ARCH=arm64
+            DTC=$(which dtc)
+            DEPMOD=depmod
+            HOSTCC="ccache clang"
+            HOSTCXX="ccache clang++"
+            CC="ccache clang"
+          )
+
           EXTRA_SYMBOLS=""
 
           for EXT_MOD in "${EXT_MODULES[@]}"; do
             EXT_MOD_ACTUAL=$(echo "$EXT_MOD" | sed "s/\.\${QCACLD_DEV_NAME}/.qca6750/")
             
-            CLEAN_PATH="${EXT_MOD_ACTUAL#../}"
-            TARGET_DIR="$GITHUB_WORKSPACE/$CLEAN_PATH"
-            
-            if [[ ! -d "$TARGET_DIR" ]]; then
-              echo "WARNING: The following module path does not exist : $TARGET_DIR" >&2
+            if [[ ! -d "$ROOT/$EXT_MOD_ACTUAL" ]]; then
+              echo "WARNING: The following module path does not exist : $EXT_MOD_ACTUAL" >&2
               continue
             fi
             
             echo "Building $EXT_MOD_ACTUAL..."
             
-            EXT_MOD_REL=$(realpath -s --relative-to="$ROOT" "$TARGET_DIR")
-            
-            # Fix for securemsm-kernel __stringify issue
-            if [[ "$EXT_MOD_ACTUAL" == *"securemsm-kernel"* ]]; then
-              echo "Patching trace_smcinvoke.h for securemsm-kernel..."
-              if [[ -f "$TARGET_DIR/smcinvoke/compat/trace_smcinvoke.h" ]]; then
-                sed -i 's/__stringify(\(.*\))/\1/g' "$TARGET_DIR/smcinvoke/compat/trace_smcinvoke.h" || true
-              fi
-            fi
-            
-            EXTRA_CFLAGS="$WARN_FLAGS -include linux/stringify.h -I$ROOT/include -I$ROOT/arch/arm64/include"
+            EXT_MOD_REL=$(realpath -s --relative-to="$ROOT" "$ROOT/$EXT_MOD_ACTUAL")
             
             if [[ "$EXT_MOD_ACTUAL" == *"qcacld-3.0"* ]]; then
+              TARGET_DIR="$ROOT/$EXT_MOD_ACTUAL"
               echo "Applying monitor mode configs to WLAN..."
               ln -sfn ../qca-wifi-host-cmn "$TARGET_DIR/cmn"
               for dcfg in "$TARGET_DIR/configs/"*qca6750* "$TARGET_DIR/configs/default_defconfig"; do
@@ -388,34 +387,28 @@ jobs:
 
               export KBUILD_EXTRA_SYMBOLS="$EXTRA_SYMBOLS"
 
-              make -j$(nproc --all) -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
-                ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
-                KERNEL_SRC="$ROOT" \
+              # Using EXACTLY their MAKE_FLAGS logic
+              make -C "$TARGET_DIR" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT" \
                 WLAN_ROOT="$TARGET_DIR" WLAN_COMMON_ROOT=cmn WLAN_COMMON_INC="$TARGET_DIR/cmn" \
                 WLAN_FW_API="$TARGET_DIR/../fw-api/" CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
                 CONFIG_CNSS_OUT_OF_TREE=y CONFIG_IPA_OUT_OF_TREE=y CONFIG_QCA_WIFI_ISOC=0 \
                 CONFIG_QCA_WIFI_2_0=1 WLAN_PROFILE=qca6750 CONFIG_QCA_CLD_WLAN_PROFILE=qca6750 \
                 CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y DYNAMIC_SINGLE_CHIP=qca6750 DEVNAME=qca6750 \
                 MODNAME=qca_cld3_qca6750 CONFIG_QCA_CLD_WLAN=m \
-                KCFLAGS="$EXTRA_CFLAGS -DFEATURE_MONITOR_MODE_SUPPORT -DCONFIG_FEATURE_MONITOR_MODE_SUPPORT=1" \
                 modules 2>&1 | tee "$OUT/wlan_build.log"
 
+              make -C "$TARGET_DIR" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT" \
+                INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_DIR="extra/$EXT_MOD_ACTUAL" modules_install
+              
               llvm-strip --strip-debug "$TARGET_DIR/qca_cld3_qca6750.ko"
             else
-              make -j$(nproc --all) -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
-                ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
-                KERNEL_SRC="$ROOT" CONFIG_ARCH_CLIFFS=y CONFIG_ARCH_QCOM=y \
-                KCFLAGS="$EXTRA_CFLAGS" \
-                modules
-                
-              make -j$(nproc --all) -C "$TARGET_DIR" M="$EXT_MOD_REL" O="$OUT" \
-                ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" \
-                KERNEL_SRC="$ROOT" INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_DIR="extra/$CLEAN_PATH" \
-                modules_install
+              # Using EXACTLY their MAKE_FLAGS logic
+              make -C "$ROOT/$EXT_MOD_ACTUAL" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT"
+              make -C "$ROOT/$EXT_MOD_ACTUAL" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT" INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$OUT/modules_staging" INSTALL_MOD_DIR="extra/$EXT_MOD_ACTUAL" modules_install
             fi
 
-            if [[ -f "$TARGET_DIR/Module.symvers" ]]; then
-              EXTRA_SYMBOLS+=" $TARGET_DIR/Module.symvers"
+            if [[ -f "$ROOT/$EXT_MOD_ACTUAL/Module.symvers" ]]; then
+              EXTRA_SYMBOLS+=" $ROOT/$EXT_MOD_ACTUAL/Module.symvers"
             fi
           done
           echo "::endgroup::"
