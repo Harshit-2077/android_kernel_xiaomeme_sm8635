@@ -487,37 +487,38 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$STAGE"
           rm -rf "$STAGE/.git"
 
-          cat << 'AKEOF' > "$STAGE/anykernel.sh"
-#!/sbin/sh
-properties() {
-kernel.string=Lucy-Monitor
-do.devicecheck=1
-do.modules=0
-do.systemless=1
-do.cleanup=1
-do.cleanuponabort=0
-device.name1=peridot
-device.name2=pineapple
-device.name3=
-device.name4=
-device.name5=
-supported.versions=
-supported.patchlevels=
-}
-. $AKHOME/tools/ak3-core.sh
-dump_boot
-if [ -f "$AKHOME/qca_cld3_qca6750.ko" ]; then
-    for Lucy_tgt in /vendor_dlkm/lib/modules/qca_cld3_qca6750.ko /vendor/lib/modules/qca_cld3_qca6750.ko; do
-        Lucy_tdir=$(dirname "$Lucy_tgt")
-        if [ -d "$Lucy_tdir" ]; then
-            mount -o rw,remount "$(echo "$Lucy_tgt" | cut -d/ -f1-2)" 2>/dev/null || true
-            cp -f "$AKHOME/qca_cld3_qca6750.ko" "$Lucy_tgt" 2>/dev/null && \
-            { chmod 644 "$Lucy_tgt"; chown 0:0 "$Lucy_tgt"; restorecon "$Lucy_tgt" 2>/dev/null; break; }
-        fi
-    done
-fi
-write_boot
-AKEOF
+          # Use sed to strip leading spaces so the heredoc is YAML-safe and bash-safe
+          cat << 'AKEOF' | sed 's/^[ \t]*//' > "$STAGE/anykernel.sh"
+          #!/sbin/sh
+          properties() {
+          kernel.string=Lucy-Monitor
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=peridot
+          device.name2=pineapple
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          }
+          . $AKHOME/tools/ak3-core.sh
+          dump_boot
+          if [ -f "$AKHOME/qca_cld3_qca6750.ko" ]; then
+              for Lucy_tgt in /vendor_dlkm/lib/modules/qca_cld3_qca6750.ko /vendor/lib/modules/qca_cld3_qca6750.ko; do
+                  Lucy_tdir=$(dirname "$Lucy_tgt")
+                  if [ -d "$Lucy_tdir" ]; then
+                      mount -o rw,remount "$(echo "$Lucy_tgt" | cut -d/ -f1-2)" 2>/dev/null || true
+                      cp -f "$AKHOME/qca_cld3_qca6750.ko" "$Lucy_tgt" 2>/dev/null && \
+                      { chmod 644 "$Lucy_tgt"; chown 0:0 "$Lucy_tgt"; restorecon "$Lucy_tgt" 2>/dev/null; break; }
+                  fi
+              done
+          fi
+          write_boot
+          AKEOF
 
           cp -f "$OUT/arch/arm64/boot/Image" "$STAGE/Image"
           
