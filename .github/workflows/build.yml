@@ -182,9 +182,6 @@ jobs:
           echo "$CLANG_BIN" >> "$GITHUB_PATH"
           echo "Using clang: $CLANG_BIN"
           $CLANG_BIN/clang --version
-          RES_DIR="$("$CLANG_BIN/clang" --print-resource-dir)"
-          echo "Clang resource dir: $RES_DIR"
-          ls -l "$RES_DIR/include/stddef.h" || echo "WARNING: stddef.h missing in this toolchain" >&2
 
       - name: Restore Build Cache
         uses: actions/cache/restore@v4
@@ -407,19 +404,14 @@ jobs:
 
           echo "::group::3. Compile External Modules (Following build.config order)"
 
-          # Module compilation flow adapted from the Dragonw1nd kernel action.
           cd "$ROOT"
           KDIR="$(realpath "$ROOT/$KERNEL_DIR")"
           MODULES_STAGING_DIR="$OUT/modules_staging"
 
-          # Exports for external kernel modules
           export BOARD_PLATFORM="$SOC"
           export TARGET_BOARD_PLATFORM="$SOC"
           export MSM_ARCH="$SOC"
 
-          # Allow build.config to override MAKE_FLAGS.
-          # NOTE: no KCFLAGS/EXTRA_CFLAGS here on purpose - a command-line value overrides the
-          # modules' own Kbuild "+=" flags (include paths, CONFIG_* headers, etc).
           if [[ ! -v MAKE_FLAGS ]]; then
             MAKE_FLAGS=(
               -j$(nproc --all)
@@ -437,7 +429,6 @@ jobs:
           echo "Compiling vendor modules (qcom)"
 
           for EXT_MOD in "${EXT_MODULES[@]}"; do
-            # Resolve a literal ".${QCACLD_DEV_NAME}" left unexpanded by the build config
             EXT_MOD=$(echo "$EXT_MOD" | sed "s/\.\${QCACLD_DEV_NAME}/.${QCACLD_DEV_NAME}/")
 
             if [[ ! -d "$ROOT/$EXT_MOD" ]]; then
@@ -446,21 +437,26 @@ jobs:
             fi
 
             # --- Source patches (not compile logic) ---
-            # securemsm-kernel: drop -Werror / stringify issues, fix hardcoded trace include path
             if [[ "$EXT_MOD" == *"securemsm-kernel"* ]]; then
               echo "Patching securemsm-kernel..."
               find "$ROOT/$EXT_MOD" -type f -name "Makefile" -exec sed -i 's/-Werror//g' {} + 2>/dev/null || true
               find "$ROOT/$EXT_MOD" -type f -name "Kbuild" -exec sed -i 's/-Werror//g' {} + 2>/dev/null || true
               find "$ROOT/$EXT_MOD" -name "trace_smcinvoke.h" -exec sed -i 's/__stringify(\(.*\))/\1/g' {} + 2>/dev/null || true
               find "$ROOT/$EXT_MOD" -name "trace_smcinvoke.h" -exec sed -i '1i #include <linux/stringify.h>' {} + 2>/dev/null || true
-              # Point TRACE_INCLUDE_PATH at the real absolute dir (the hardcoded ../../../../sm8635-modules/... path doesn't exist here)
-              find "$ROOT/$EXT_MOD" -name 'trace_*.h' | while read -r th; do
-                d=$(dirname "$(realpath "$th")")
-                sed -i -E "s|^(#define[[:space:]]+TRACE_INCLUDE_PATH[[:space:]]+).*|\1$d|" "$th"
-              done
             fi
 
-            # qcacld-3.0: enable monitor mode in the module's configs
+            # --- Universal Fix: Hardcoded trace header paths ---
+            # Many Qualcomm modules hardcode relative paths in trace headers.
+            # We rewrite TRACE_INCLUDE_PATH in ALL trace headers to their absolute directory.
+            echo "Fixing TRACE_INCLUDE_PATH in $EXT_MOD..."
+            find "$ROOT/$EXT_MOD" -name 'trace_*.h' | while read -r th; do
+              if grep -q "define TRACE_INCLUDE_PATH" "$th"; then
+                d=$(dirname "$(realpath "$th")")
+                sed -i -E "s|^(#define[[:space:]]+TRACE_INCLUDE_PATH[[:space:]]+).*|\1$d|" "$th"
+              fi
+            done
+            # ------------------------------------------
+
             if [[ "$EXT_MOD" == *"qcacld-3.0"* ]]; then
               echo "Applying monitor mode configs to WLAN..."
               for dcfg in "$ROOT/$EXT_MOD/configs/"*"$QCACLD_DEV_NAME"* "$ROOT/$EXT_MOD/configs/default_defconfig"; do
@@ -470,11 +466,7 @@ jobs:
 
             # --- Compile + install ---
             set -x
-
-            # The path passed via M must be relative to the kernel source directory
             EXT_MOD_REL=$(realpath -s --relative-to="$KDIR" "$ROOT/$EXT_MOD")
-
-            # The object files will be stored here
             mkdir -p "$OUT/$EXT_MOD_REL"
 
             make -C "$EXT_MOD" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT"
@@ -482,10 +474,8 @@ jobs:
             set +x
           done
 
-          # qcacld builds as <dev>.ko; rename to what the dlkm/vendor_boot lists expect
           find "$MODULES_STAGING_DIR" -name "${QCACLD_DEV_NAME}.ko" -execdir mv -f -- "{}" "qca_cld3_${QCACLD_DEV_NAME}.ko" \;
 
-          # Keep the later steps (vendor_boot + AnyKernel3) working: they read the WLAN module from the qcacld source dir
           WLAN_KO=$(find "$MODULES_STAGING_DIR" -name "qca_cld3_${QCACLD_DEV_NAME}.ko" -print -quit)
           if [[ -n "$WLAN_KO" ]]; then
             cp -f "$WLAN_KO" "$GITHUB_WORKSPACE/vendor/qcom/opensource/wlan/qcacld-3.0/qca_cld3_${QCACLD_DEV_NAME}.ko"
