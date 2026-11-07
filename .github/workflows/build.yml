@@ -16,6 +16,18 @@ on:
         required: true
         type: string
         default: 'lineage-23.2'
+      clang_version:
+        description: "Select Compiler version"
+        required: true
+        type: choice
+        options:
+          - manifest
+          - aosp-clang-3289846
+          - aosp-clang-r547379
+          - aosp-clang-r563880
+          - aosp-clang-r563880c
+          - aosp-clang-r574158
+        default: 'aosp-clang-r563880c'
       compile_dlkm:
         description: 'Build DLKMs, Modules & Boot Images (Uncheck for Kernel Image Only)'
         required: true
@@ -40,9 +52,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CACHE_KEY_STATIC: cache-Lucy-peridot-v1
+  CACHE_KEY_STATIC: cache-Lucy-peridot-${{ inputs.clang_version || 'aosp-clang-r574158' }}-v2
   KERNEL_REPO: ${{ inputs.kernel_repo || 'https://github.com/Harshit-2077/android_kernel_xiaomeme_sm8635.git' }}
   KERNEL_BRANCH: ${{ inputs.kernel_branch || 'lineage-23.2' }}
+  CLANG_INPUT: ${{ inputs.clang_version || 'aosp-clang-r574158' }}
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   
   # Global Paths (Available to all steps)
@@ -106,18 +119,6 @@ jobs:
           curl -sL https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT | base64 -d | sudo tee /usr/local/bin/avbtool > /dev/null
           sudo chmod +x /usr/local/bin/avbtool
 
-      - name: Setup Neutron Clang Toolchain
-        run: |
-          mkdir -p "$HOME/clang"
-          cd "$HOME/clang"
-          curl -sL "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman" -o antman
-          chmod +x antman
-          ./antman -S
-          ./antman --patch=glibc
-          
-          echo "CLANG_DIR=$HOME/clang" >> "$GITHUB_ENV"
-          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
-
       - name: Clone Kernel Source & Kernel Kit
         run: |
           echo "Cloning kernel source from $KERNEL_REPO ($KERNEL_BRANCH)..."
@@ -130,6 +131,51 @@ jobs:
           git clone --depth=1 --branch lineage-23.2 "https://github.com/Harshit-2077/android_kernel_xiaomi_sm8635-modules.git" "$GITHUB_WORKSPACE/modules_src"
           
           ln -sfn "$GITHUB_WORKSPACE/modules_src" "$GITHUB_WORKSPACE/vendor"
+
+      # --- EXACT COPY OF THEIR CLANG SETUP ---
+      - name: Setup clang type
+        if: ${{ env.CLANG_INPUT != 'default' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CLANG=${{ env.CLANG_INPUT }}" >> "${GITHUB_ENV}"
+
+      - name: Download Clang (toolchain for build)
+        uses: nullptr-t-oss/kernel_toolchains/clang_setup@main
+        if: env.CLANG != 'manifest'
+        with:
+          clang-version: '${{ env.CLANG }}'
+          install-dir: '${{ env.ROOT }}/prebuilts/clang/host/linux-x86'
+
+      - name: Detect Clang (toolchain for build)
+        if:  env.CLANG == 'manifest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Detecting Clang..."
+          CLANG_FOUND=false
+          for base in "${ROOT}/prebuilts" "${ROOT}/prebuilts-master"; do
+            [ -d "${base}/clang/host/linux-x86" ] || continue
+
+            latest=$(ls -d "$base"/clang/host/linux-x86/clang-r*/ 2>/dev/null | sort -V | tail -n1 || true)
+            if [ -n "${latest}" ] && [ -x "${latest}/bin/clang" ]; then
+              CLANG_BIN="${latest}/bin"
+              CLANG_FOUND=true
+            fi
+          done
+          if ! ${CLANG_FOUND} && command -v clang >/dev/null 2>&1; then
+            CLANG_BIN="$(dirname "$(command -v clang)")"
+            CLANG_FOUND=true
+            echo "Using system clang."
+          fi
+          ${CLANG_FOUND} || { echo "No clang toolchain found"; exit 1; }
+          echo "${CLANG_BIN}" >> "${GITHUB_PATH}"
+          CLANG_VERSION="$("${CLANG_BIN}/clang" --version | head -n1)"
+          echo "CLANG_VERSION=${CLANG_VERSION}" >> "${GITHUB_ENV}"
+          echo "[NOTICE] Using clang : ${CLANG_VERSION}"
+          echo "Clang detected ✅"
+          echo "::endgroup::"
+      # ----------------------------------------
 
       - name: Restore Build Cache
         uses: actions/cache/restore@v4
@@ -362,9 +408,6 @@ jobs:
           export TARGET_BOARD_PLATFORM="$SOC"
           export MSM_ARCH="$SOC"
 
-          # Allow build.config to override MAKE_FLAGS.
-          # NOTE: no KCFLAGS/EXTRA_CFLAGS here on purpose - a command-line value overrides the
-          # modules' own Kbuild "+=" flags (include paths, CONFIG_* headers, etc).
           if [[ ! -v MAKE_FLAGS ]]; then
             MAKE_FLAGS=(
               -j$(nproc --all)
@@ -382,7 +425,6 @@ jobs:
           echo "Compiling vendor modules (qcom)"
 
           for EXT_MOD in "${EXT_MODULES[@]}"; do
-            # Resolve a literal ".${QCACLD_DEV_NAME}" left unexpanded by the build config
             EXT_MOD=$(echo "$EXT_MOD" | sed "s/\.\${QCACLD_DEV_NAME}/.${QCACLD_DEV_NAME}/")
 
             if [[ ! -d "$ROOT/$EXT_MOD" ]]; then
@@ -390,7 +432,6 @@ jobs:
               continue
             fi
 
-            # --- Source patches (not compile logic) ---
             # securemsm-kernel: drop -Werror / stringify issues, fix hardcoded trace include path
             if [[ "$EXT_MOD" == *"securemsm-kernel"* ]]; then
               echo "Patching securemsm-kernel..."
@@ -398,7 +439,6 @@ jobs:
               find "$ROOT/$EXT_MOD" -type f -name "Kbuild" -exec sed -i 's/-Werror//g' {} + 2>/dev/null || true
               find "$ROOT/$EXT_MOD" -name "trace_smcinvoke.h" -exec sed -i 's/__stringify(\(.*\))/\1/g' {} + 2>/dev/null || true
               find "$ROOT/$EXT_MOD" -name "trace_smcinvoke.h" -exec sed -i '1i #include <linux/stringify.h>' {} + 2>/dev/null || true
-              # Point TRACE_INCLUDE_PATH at the real absolute dir (the hardcoded ../../../../sm8635-modules/... path doesn't exist here)
               find "$ROOT/$EXT_MOD" -name 'trace_*.h' | while read -r th; do
                 d=$(dirname "$(realpath "$th")")
                 sed -i -E "s|^(#define[[:space:]]+TRACE_INCLUDE_PATH[[:space:]]+).*|\1$d|" "$th"
@@ -413,13 +453,8 @@ jobs:
               done
             fi
 
-            # --- Compile + install ---
             set -x
-
-            # The path passed via M must be relative to the kernel source directory
             EXT_MOD_REL=$(realpath -s --relative-to="$KDIR" "$ROOT/$EXT_MOD")
-
-            # The object files will be stored here
             mkdir -p "$OUT/$EXT_MOD_REL"
 
             make -C "$EXT_MOD" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT"
@@ -427,10 +462,8 @@ jobs:
             set +x
           done
 
-          # qcacld builds as <dev>.ko; rename to what the dlkm/vendor_boot lists expect
           find "$MODULES_STAGING_DIR" -name "${QCACLD_DEV_NAME}.ko" -execdir mv -f -- "{}" "qca_cld3_${QCACLD_DEV_NAME}.ko" \;
 
-          # Keep the later steps (vendor_boot + AnyKernel3) working: they read the WLAN module from the qcacld source dir
           WLAN_KO=$(find "$MODULES_STAGING_DIR" -name "qca_cld3_${QCACLD_DEV_NAME}.ko" -print -quit)
           if [[ -n "$WLAN_KO" ]]; then
             cp -f "$WLAN_KO" "$GITHUB_WORKSPACE/vendor/qcom/opensource/wlan/qcacld-3.0/qca_cld3_${QCACLD_DEV_NAME}.ko"
