@@ -58,23 +58,18 @@ env:
   CLANG_INPUT: ${{ inputs.clang_version || 'aosp-clang-r574158' }}
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   
-  # Global Paths (Available to all steps)
   FLAVOR: "Lucy-monitor"
   ROOT: "${{ github.workspace }}/kernel_src"
-  ROOT_DIR: "${{ github.workspace }}/kernel_src"
   KERNEL_DIR: "."
   OUT: "${{ github.workspace }}/out"
   DIST: "${{ github.workspace }}/dist"
   DYNAMIC_CACHE_DIR: "${{ github.workspace }}/out/dynamic_cache"
   KERNEL_KIT: "${{ github.workspace }}/kernel_kit"
   
-  # Build Variables
   SOC: "cliffs"
   CODENAME: "peridot"
   OS_SHORT: "los23.2"
   QCACLD_DEV_NAME: "qca6750"
-  TARGET_BOARD_PLATFORM: "cliffs"
-  BOARD_PLATFORM: "cliffs"
   
   WARN_FLAGS: "-Wno-error -Wno-gnu-zero-variadic-macro-arguments -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-format"
 
@@ -132,23 +127,26 @@ jobs:
           
           ln -sfn "$GITHUB_WORKSPACE/modules_src" "$GITHUB_WORKSPACE/vendor"
 
+      - name: Setup clang type
+        if: ${{ env.CLANG_INPUT != 'default' }}
+        shell: bash
+        run: echo "CLANG=${{ env.CLANG_INPUT }}" >> "${GITHUB_ENV}"
+
       - name: Download Clang (toolchain for build)
-        if: env.CLANG_INPUT != 'manifest'
         uses: nullptr-t-oss/kernel_toolchains/clang_setup@main
+        if: env.CLANG != 'manifest'
         with:
-          clang-version: '${{ env.CLANG_INPUT }}'
-          install-dir: '${{ github.workspace }}/kernel_src/prebuilts/clang/host/linux-x86'
+          clang-version: '${{ env.CLANG }}'
+          install-dir: '${{ env.ROOT }}/prebuilts/clang/host/linux-x86'
 
       - name: Detect Clang (toolchain for build)
-        if: env.CLANG_INPUT == 'manifest'
+        if:  env.CLANG == 'manifest'
         shell: bash
         run: |
           set -euo pipefail
-          echo "::group::Detecting Clang..."
           CLANG_FOUND=false
           for base in "${ROOT}/prebuilts" "${ROOT}/prebuilts-master"; do
             [ -d "${base}/clang/host/linux-x86" ] || continue
-
             latest=$(ls -d "$base"/clang/host/linux-x86/clang-r*/ 2>/dev/null | sort -V | tail -n1 || true)
             if [ -n "${latest}" ] && [ -x "${latest}/bin/clang" ]; then
               CLANG_BIN="${latest}/bin"
@@ -158,15 +156,10 @@ jobs:
           if ! ${CLANG_FOUND} && command -v clang >/dev/null 2>&1; then
             CLANG_BIN="$(dirname "$(command -v clang)")"
             CLANG_FOUND=true
-            echo "Using system clang."
           fi
           ${CLANG_FOUND} || { echo "No clang toolchain found"; exit 1; }
           echo "${CLANG_BIN}" >> "${GITHUB_PATH}"
-          CLANG_VERSION="$("${CLANG_BIN}/clang" --version | head -n1)"
-          echo "CLANG_VERSION=${CLANG_VERSION}" >> "${GITHUB_ENV}"
-          echo "[NOTICE] Using clang : ${CLANG_VERSION}"
-          echo "Clang detected ✅"
-          echo "::endgroup::"
+          echo "CLANG_VERSION=$("${CLANG_BIN}/clang" --version | head -n1)" >> "${GITHUB_ENV}"
 
       - name: Export Downloaded Clang to Path
         if: env.CLANG_INPUT != 'manifest'
@@ -180,7 +173,6 @@ jobs:
           fi
           echo "CLANG_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
           echo "$CLANG_BIN" >> "$GITHUB_PATH"
-          echo "Using clang: $CLANG_BIN"
           $CLANG_BIN/clang --version
 
       - name: Restore Build Cache
@@ -197,7 +189,6 @@ jobs:
 
           export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
           export KBUILD_BUILD_USER="Harshit-2077" KBUILD_BUILD_HOST="Lucy"
-          
           export CCACHE_DIR="$OUT/ccache"
           mkdir -p "$CCACHE_DIR"
           ccache -o compression=false
@@ -205,14 +196,12 @@ jobs:
 
           cd "$ROOT"
 
-          echo "::group::0. Fix OpenSSL 3.0 key_pass"
+          rm -rf "$OUT/tools/bpf" "$OUT/scripts" "$OUT/include/generated"
+
           if [[ -f "$ROOT/certs/extract-cert.c" ]]; then
             sed -i '/static.*key_pass/d' "$ROOT/certs/extract-cert.c"
             sed -i '1i __attribute__((unused)) static const char *key_pass;' "$ROOT/certs/extract-cert.c"
           fi
-          echo "::endgroup::"
-
-          echo "::group::1. Defconfig & Compile"
 
           MTIME_CACHE="$KERNEL_KIT/scripts/dynamic_mtime.sh"
           if [[ -f "$MTIME_CACHE" ]]; then
@@ -235,12 +224,9 @@ jobs:
             make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
           fi
 
-          echo "::group::Applying Droidspaces patch"
           curl -sL "https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch" -o /tmp/droidspaces.patch
           patch -p1 -F 3 -i /tmp/droidspaces.patch
-          echo "::endgroup::"
 
-          echo "::group::Applying NetHunter & Other Configs"
           ./scripts/config --file "$OUT/.config" \
             --set-str LOCALVERSION "-Lucy-Monitor" -d LOCALVERSION_AUTO -d WERROR \
             --set-val UCLAMP_BUCKETS_COUNT 20 -d TASK_DELAY_ACCT -d RSEQ -d SCHED_CLUSTER \
@@ -280,16 +266,13 @@ jobs:
             -e CONFIG_DEVTMPFS -e CONFIG_NETFILTER_XT_MATCH_ADDRTYPE \
             -e CONFIG_NETFILTER_XT_SET -e CONFIG_NETFILTER_XT_TARGET_REJECT \
             -e CONFIG_NETFILTER_XT_TARGET_LOG -e CONFIG_NETFILTER_XT_MATCH_RECENT
-          echo "::endgroup::"
 
-          echo "::group::Adding rtw88 modules"
           cd "$ROOT/drivers/net/wireless/realtek/"
           rm -rf rtw88
           git clone https://github.com/nullptr-t-oss/rtw88.git
           sed -i 's/$(CONFIG_RTW88)/m/g' Makefile
           sed -i '/^source "drivers\/net\/wireless\/realtek\/rtw88\/Kconfig"$/s/.*/ /' Kconfig
           cd "$ROOT"
-          echo "::endgroup::"
 
           set +u
           if declare -f compile_system_dlkm_modules > /dev/null; then
@@ -309,7 +292,6 @@ jobs:
           fi
 
           make "${K_MAKE_FLAGS[@]}" Image modules
-
           cp -f "$OUT/arch/arm64/boot/Image" "$DIST/Image-$FLAVOR"
           cp -f "$OUT/.config" "$DIST/config-$FLAVOR"
 
@@ -320,7 +302,6 @@ jobs:
           cd "$ROOT"
           
           echo "UNAME=$UNAME" >> "$GITHUB_ENV"
-          echo "::endgroup::"
 
       - name: Delete Old Build Cache
         if: success()
@@ -347,7 +328,6 @@ jobs:
           source "$BUILD_CONFIG"
           set -u
 
-          echo "::group::2. Build system_dlkm & vendor_dlkm (His Way)"
           if [[ -d "$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin" ]]; then
             export PATH="$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux_musl-x86/bin:$PATH"
           elif [[ -d "$KERNEL_KIT/bin/kernel/prebuilts/build-tools/linux-x86/bin" ]]; then
@@ -400,21 +380,10 @@ jobs:
 
           build_image "$VEND_STAGE" "$vendor_dlkm_props_file" "$DIST/vendor_dlkm.img" /dev/null
           avbtool add_hashtree_footer --partition_name vendor_dlkm --hash_algorithm sha256 --image "$DIST/vendor_dlkm.img" --do_not_generate_fec
-          echo "::endgroup::"
 
-          echo "::group::3. Compile External Modules (Following build.config order)"
-
-          # Module compilation flow adapted from the Dragonw1nd kernel action.
-          cd "$ROOT"
           KDIR="$(realpath "$ROOT/$KERNEL_DIR")"
           MODULES_STAGING_DIR="$OUT/modules_staging"
 
-          # Exports for external kernel modules
-          export BOARD_PLATFORM="$SOC"
-          export TARGET_BOARD_PLATFORM="$SOC"
-          export MSM_ARCH="$SOC"
-
-          # Allow build.config to override MAKE_FLAGS.
           if [[ ! -v MAKE_FLAGS ]]; then
             MAKE_FLAGS=(
               -j$(nproc --all)
@@ -429,10 +398,7 @@ jobs:
           fi
           MAKE_FLAGS+=( KERNEL_SRC="$KDIR" )
 
-          echo "Compiling vendor modules (qcom)"
-
           for EXT_MOD in "${EXT_MODULES[@]}"; do
-            # Resolve a literal ".${QCACLD_DEV_NAME}" left unexpanded by the build config
             EXT_MOD=$(echo "$EXT_MOD" | sed "s/\.\${QCACLD_DEV_NAME}/.${QCACLD_DEV_NAME}/")
 
             if [[ ! -d "$ROOT/$EXT_MOD" ]]; then
@@ -440,44 +406,24 @@ jobs:
               continue
             fi
 
-            # --- Source patches (not compile logic) ---
-            # securemsm-kernel: drop -Werror / stringify issues, fix hardcoded trace include path
-            if [[ "$EXT_MOD" == *"securemsm-kernel"* ]]; then
-              echo "Patching securemsm-kernel..."
-              find "$ROOT/$EXT_MOD" -type f -name "Makefile" -exec sed -i 's/-Werror//g' {} + 2>/dev/null || true
-              find "$ROOT/$EXT_MOD" -type f -name "Kbuild" -exec sed -i 's/-Werror//g' {} + 2>/dev/null || true
-              find "$ROOT/$EXT_MOD" -name "trace_smcinvoke.h" -exec sed -i 's/__stringify(\(.*\))/\1/g' {} + 2>/dev/null || true
-              find "$ROOT/$EXT_MOD" -name "trace_smcinvoke.h" -exec sed -i '1i #include <linux/stringify.h>' {} + 2>/dev/null || true
-            fi
-
             # --- Universal Fix: Hardcoded trace header paths ---
-            # Many Qualcomm modules hardcode relative paths in trace headers.
-            # We rewrite TRACE_INCLUDE_PATH in ALL trace headers to their absolute directory.
-            echo "Fixing TRACE_INCLUDE_PATH in $EXT_MOD..."
             find "$ROOT/$EXT_MOD" -name 'trace_*.h' | while read -r th; do
               if grep -q "define TRACE_INCLUDE_PATH" "$th"; then
                 d=$(dirname "$(realpath "$th")")
-                # Handles both "#define" and "# define" spacing
                 sed -i -E "s|^#[[:space:]]*define[[:space:]]+TRACE_INCLUDE_PATH.*|#define TRACE_INCLUDE_PATH $d|" "$th"
               fi
             done
             # ------------------------------------------
 
-            # qcacld-3.0: enable monitor mode in the module's configs
+            # Only remaining patch: Enable Monitor Mode for the WLAN driver
             if [[ "$EXT_MOD" == *"qcacld-3.0"* ]]; then
-              echo "Applying monitor mode configs to WLAN..."
               for dcfg in "$ROOT/$EXT_MOD/configs/"*"$QCACLD_DEV_NAME"* "$ROOT/$EXT_MOD/configs/default_defconfig"; do
                 [[ -f "$dcfg" ]] && { sed -i '/CONFIG_FEATURE_MONITOR_MODE_SUPPORT/d' "$dcfg"; echo "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y" >> "$dcfg"; }
               done
             fi
 
-            # --- Compile + install ---
             set -x
-
-            # The path passed via M must be relative to the kernel source directory
             EXT_MOD_REL=$(realpath -s --relative-to="$KDIR" "$ROOT/$EXT_MOD")
-
-            # The object files will be stored here
             mkdir -p "$OUT/$EXT_MOD_REL"
 
             make -C "$EXT_MOD" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT"
@@ -485,19 +431,13 @@ jobs:
             set +x
           done
 
-          # qcacld builds as <dev>.ko; rename to what the dlkm/vendor_boot lists expect
           find "$MODULES_STAGING_DIR" -name "${QCACLD_DEV_NAME}.ko" -execdir mv -f -- "{}" "qca_cld3_${QCACLD_DEV_NAME}.ko" \;
 
-          # Keep the later steps (vendor_boot + AnyKernel3) working: they read the WLAN module from the qcacld source dir
           WLAN_KO=$(find "$MODULES_STAGING_DIR" -name "qca_cld3_${QCACLD_DEV_NAME}.ko" -print -quit)
           if [[ -n "$WLAN_KO" ]]; then
             cp -f "$WLAN_KO" "$GITHUB_WORKSPACE/vendor/qcom/opensource/wlan/qcacld-3.0/qca_cld3_${QCACLD_DEV_NAME}.ko"
-          else
-            echo "WARNING: qca_cld3_${QCACLD_DEV_NAME}.ko was not produced" >&2
           fi
-          echo "::endgroup::"
 
-          echo "::group::4. Vendor Boot Image (His Way)"
           VB_RAMDISK_DIR="$OUT/vendor_boot_ramdisk"
           mkdir -p "$VB_RAMDISK_DIR/lib/modules/$UNAME"
           
@@ -536,7 +476,6 @@ jobs:
             --vendor_boot "$DIST/vendor_boot.img"
 
           avbtool add_hash_footer --partition_name vendor_boot --partition_size 100663296 --image "$DIST/vendor_boot.img" --algorithm SHA256_RSA4096 --key "$KERNEL_KIT/tools/mkbootimg/gki/testdata/testkey_rsa4096.pem"
-          echo "::endgroup::"
 
       - name: Package AnyKernel3
         shell: bash
@@ -544,47 +483,41 @@ jobs:
           set -euo pipefail
           cd "$ROOT"
 
-          echo "::group::5. Packaging Artifacts"
           STAGE="$(mktemp -d)"
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$STAGE"
           rm -rf "$STAGE/.git"
 
-          echo '#!/sbin/sh' > "$STAGE/anykernel.sh"
-          echo 'properties() { ' >> "$STAGE/anykernel.sh"
-          echo 'kernel.string=Lucy-Monitor' >> "$STAGE/anykernel.sh"
-          echo 'do.devicecheck=1' >> "$STAGE/anykernel.sh"
-          echo 'do.modules=0' >> "$STAGE/anykernel.sh"
-          echo 'do.systemless=1' >> "$STAGE/anykernel.sh"
-          echo 'do.cleanup=1' >> "$STAGE/anykernel.sh"
-          echo 'do.cleanuponabort=0' >> "$STAGE/anykernel.sh"
-          echo 'device.name1=peridot' >> "$STAGE/anykernel.sh"
-          echo 'device.name2=pineapple' >> "$STAGE/anykernel.sh"
-          echo 'device.name3=' >> "$STAGE/anykernel.sh"
-          echo 'device.name4=' >> "$STAGE/anykernel.sh"
-          echo 'device.name5=' >> "$STAGE/anykernel.sh"
-          echo 'supported.versions=' >> "$STAGE/anykernel.sh"
-          echo 'supported.patchlevels=' >> "$STAGE/anykernel.sh"
-          echo '}; # end properties' >> "$STAGE/anykernel.sh"
-          echo '' >> "$STAGE/anykernel.sh"
-          echo '## AnyKernel methods (DO NOT CHANGE)' >> "$STAGE/anykernel.sh"
-          echo '. $AKHOME/tools/ak3-core.sh' >> "$STAGE/anykernel.sh"
-          echo '' >> "$STAGE/anykernel.sh"
-          echo '## AnyKernel install' >> "$STAGE/anykernel.sh"
-          echo 'dump_boot' >> "$STAGE/anykernel.sh"
-          echo '' >> "$STAGE/anykernel.sh"
-          echo '# Lucy WLAN module injection' >> "$STAGE/anykernel.sh"
-          echo 'if [ -f "$AKHOME/qca_cld3_qca6750.ko" ]; then' >> "$STAGE/anykernel.sh"
-          echo '    for Lucy_tgt in /vendor_dlkm/lib/modules/qca_cld3_qca6750.ko /vendor/lib/modules/qca_cld3_qca6750.ko; do' >> "$STAGE/anykernel.sh"
-          echo '        Lucy_tdir=$(dirname "$Lucy_tgt")' >> "$STAGE/anykernel.sh"
-          echo '        if [ -d "$Lucy_tdir" ]; then' >> "$STAGE/anykernel.sh"
-          echo '            mount -o rw,remount "$(echo "$Lucy_tgt" | cut -d/ -f1-2)" 2>/dev/null || true' >> "$STAGE/anykernel.sh"
-          echo '            cp -f "$AKHOME/qca_cld3_qca6750.ko" "$Lucy_tgt" 2>/dev/null && \' >> "$STAGE/anykernel.sh"
-          echo '            { chmod 644 "$Lucy_tgt"; chown 0:0 "$Lucy_tgt"; restorecon "$Lucy_tgt" 2>/dev/null; break; }' >> "$STAGE/anykernel.sh"
-          echo '        fi' >> "$STAGE/anykernel.sh"
-          echo '    done' >> "$STAGE/anykernel.sh"
-          echo 'fi' >> "$STAGE/anykernel.sh"
-          echo '' >> "$STAGE/anykernel.sh"
-          echo 'write_boot' >> "$STAGE/anykernel.sh"
+          cat << 'AKEOF' > "$STAGE/anykernel.sh"
+#!/sbin/sh
+properties() {
+kernel.string=Lucy-Monitor
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=peridot
+device.name2=pineapple
+device.name3=
+device.name4=
+device.name5=
+supported.versions=
+supported.patchlevels=
+}
+. $AKHOME/tools/ak3-core.sh
+dump_boot
+if [ -f "$AKHOME/qca_cld3_qca6750.ko" ]; then
+    for Lucy_tgt in /vendor_dlkm/lib/modules/qca_cld3_qca6750.ko /vendor/lib/modules/qca_cld3_qca6750.ko; do
+        Lucy_tdir=$(dirname "$Lucy_tgt")
+        if [ -d "$Lucy_tdir" ]; then
+            mount -o rw,remount "$(echo "$Lucy_tgt" | cut -d/ -f1-2)" 2>/dev/null || true
+            cp -f "$AKHOME/qca_cld3_qca6750.ko" "$Lucy_tgt" 2>/dev/null && \
+            { chmod 644 "$Lucy_tgt"; chown 0:0 "$Lucy_tgt"; restorecon "$Lucy_tgt" 2>/dev/null; break; }
+        fi
+    done
+fi
+write_boot
+AKEOF
 
           cp -f "$OUT/arch/arm64/boot/Image" "$STAGE/Image"
           
@@ -595,7 +528,6 @@ jobs:
 
           (cd "$STAGE" && zip -r9q "$DIST/Lucy-Monitor-${FLAVOR}-$(date -u +%Y%m%d)-$(cd "$ROOT" && git rev-parse --short=7 HEAD).zip" .)
           rm -rf "$STAGE"
-          echo "::endgroup::"
 
       - name: Fetch NetHunter Wireless Firmware
         run: |
@@ -631,8 +563,6 @@ jobs:
           else
             NEW_TAG="${BASE_TAG}-r$((LATEST_N + 1))"
           fi
-
-          echo "Creating release: ${NEW_TAG}"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
