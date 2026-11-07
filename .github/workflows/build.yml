@@ -196,8 +196,6 @@ jobs:
 
           cd "$ROOT"
 
-          rm -rf "$OUT/tools/bpf" "$OUT/scripts" "$OUT/include/generated"
-
           if [[ -f "$ROOT/certs/extract-cert.c" ]]; then
             sed -i '/static.*key_pass/d' "$ROOT/certs/extract-cert.c"
             sed -i '1i __attribute__((unused)) static const char *key_pass;' "$ROOT/certs/extract-cert.c"
@@ -384,6 +382,11 @@ jobs:
           KDIR="$(realpath "$ROOT/$KERNEL_DIR")"
           MODULES_STAGING_DIR="$OUT/modules_staging"
 
+          # THE MISSING EXPORTS: Qualcomm modules need these to compile properly
+          export BOARD_PLATFORM="$SOC"
+          export TARGET_BOARD_PLATFORM="$SOC"
+          export MSM_ARCH="$SOC"
+
           if [[ ! -v MAKE_FLAGS ]]; then
             MAKE_FLAGS=(
               -j$(nproc --all)
@@ -397,6 +400,8 @@ jobs:
             )
           fi
           MAKE_FLAGS+=( KERNEL_SRC="$KDIR" )
+
+          EXTRA_SYMBOLS=""
 
           for EXT_MOD in "${EXT_MODULES[@]}"; do
             EXT_MOD=$(echo "$EXT_MOD" | sed "s/\.\${QCACLD_DEV_NAME}/.${QCACLD_DEV_NAME}/")
@@ -422,6 +427,11 @@ jobs:
               done
             fi
 
+            # Export EXTRA_SYMBOLS for this module to resolve cross-module dependencies
+            if [[ -n "$EXTRA_SYMBOLS" ]]; then
+              export KBUILD_EXTRA_SYMBOLS="$EXTRA_SYMBOLS"
+            fi
+
             set -x
             EXT_MOD_REL=$(realpath -s --relative-to="$KDIR" "$ROOT/$EXT_MOD")
             mkdir -p "$OUT/$EXT_MOD_REL"
@@ -429,6 +439,11 @@ jobs:
             make -C "$EXT_MOD" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT"
             make -C "$EXT_MOD" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT" INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$MODULES_STAGING_DIR" INSTALL_MOD_DIR="extra/$EXT_MOD" modules_install
             set +x
+
+            # Collect this module's symbols for the next ones
+            if [[ -f "$ROOT/$EXT_MOD/Module.symvers" ]]; then
+              EXTRA_SYMBOLS+=" $ROOT/$EXT_MOD/Module.symvers"
+            fi
           done
 
           find "$MODULES_STAGING_DIR" -name "${QCACLD_DEV_NAME}.ko" -execdir mv -f -- "{}" "qca_cld3_${QCACLD_DEV_NAME}.ko" \;
@@ -487,7 +502,6 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$STAGE"
           rm -rf "$STAGE/.git"
 
-          # Use sed to strip leading spaces so the heredoc is YAML-safe and bash-safe
           cat << 'AKEOF' | sed 's/^[ \t]*//' > "$STAGE/anykernel.sh"
           #!/sbin/sh
           properties() {
