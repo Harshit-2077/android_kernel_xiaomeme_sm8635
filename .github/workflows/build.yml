@@ -410,14 +410,16 @@ jobs:
               continue
             fi
 
+            echo "::group::Building $EXT_MOD"
+
             # --- Universal Fix: Hardcoded trace header paths ---
-            # Search by file content instead of filename to catch fastrpc_trace.h
+            # Added "|| true" to prevent grep from killing the script if there are no trace headers.
             grep -rl "define TRACE_INCLUDE_PATH" "$ROOT/$EXT_MOD" 2>/dev/null | while read -r th; do
               if [ -f "$th" ]; then
                 d=$(dirname "$(realpath "$th")")
                 sed -i -E "s|^[[:space:]]*#[[:space:]]*define[[:space:]]+TRACE_INCLUDE_PATH.*|#define TRACE_INCLUDE_PATH $d|" "$th"
               fi
-            done
+            done || true
             # ------------------------------------------
 
             if [[ "$EXT_MOD" == *"qcacld-3.0"* ]]; then
@@ -441,6 +443,8 @@ jobs:
             if [[ -f "$ROOT/$EXT_MOD/Module.symvers" ]]; then
               EXTRA_SYMBOLS+=" $ROOT/$EXT_MOD/Module.symvers"
             fi
+
+            echo "::endgroup::"
           done
 
           find "$MODULES_STAGING_DIR" -name "${QCACLD_DEV_NAME}.ko" -execdir mv -f -- "{}" "qca_cld3_${QCACLD_DEV_NAME}.ko" \;
