@@ -132,23 +132,15 @@ jobs:
           
           ln -sfn "$GITHUB_WORKSPACE/modules_src" "$GITHUB_WORKSPACE/vendor"
 
-      # --- EXACT COPY OF THEIR CLANG SETUP ---
-      - name: Setup clang type
-        if: ${{ env.CLANG_INPUT != 'default' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "CLANG=${{ env.CLANG_INPUT }}" >> "${GITHUB_ENV}"
-
       - name: Download Clang (toolchain for build)
+        if: env.CLANG_INPUT != 'manifest'
         uses: nullptr-t-oss/kernel_toolchains/clang_setup@main
-        if: env.CLANG != 'manifest'
         with:
-          clang-version: '${{ env.CLANG }}'
-          install-dir: '${{ env.ROOT }}/prebuilts/clang/host/linux-x86'
+          clang-version: '${{ env.CLANG_INPUT }}'
+          install-dir: '${{ github.workspace }}/kernel_src/prebuilts/clang/host/linux-x86'
 
       - name: Detect Clang (toolchain for build)
-        if:  env.CLANG == 'manifest'
+        if: env.CLANG_INPUT == 'manifest'
         shell: bash
         run: |
           set -euo pipefail
@@ -175,7 +167,24 @@ jobs:
           echo "[NOTICE] Using clang : ${CLANG_VERSION}"
           echo "Clang detected ✅"
           echo "::endgroup::"
-      # ----------------------------------------
+
+      - name: Export Downloaded Clang to Path
+        if: env.CLANG_INPUT != 'manifest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLANG_BIN=$(find "${{ github.workspace }}/kernel_src/prebuilts/clang/host/linux-x86" -maxdepth 2 -type d -name "bin" | head -n 1)
+          if [ -z "$CLANG_BIN" ]; then
+            echo "::error::Clang toolchain not found!"
+            exit 1
+          fi
+          echo "CLANG_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
+          echo "$CLANG_BIN" >> "$GITHUB_PATH"
+          echo "Using clang: $CLANG_BIN"
+          $CLANG_BIN/clang --version
+          RES_DIR="$("$CLANG_BIN/clang" --print-resource-dir)"
+          echo "Clang resource dir: $RES_DIR"
+          ls -l "$RES_DIR/include/stddef.h" || echo "WARNING: stddef.h missing in this toolchain" >&2
 
       - name: Restore Build Cache
         uses: actions/cache/restore@v4
@@ -408,6 +417,9 @@ jobs:
           export TARGET_BOARD_PLATFORM="$SOC"
           export MSM_ARCH="$SOC"
 
+          # Allow build.config to override MAKE_FLAGS.
+          # NOTE: no KCFLAGS/EXTRA_CFLAGS here on purpose - a command-line value overrides the
+          # modules' own Kbuild "+=" flags (include paths, CONFIG_* headers, etc).
           if [[ ! -v MAKE_FLAGS ]]; then
             MAKE_FLAGS=(
               -j$(nproc --all)
@@ -425,6 +437,7 @@ jobs:
           echo "Compiling vendor modules (qcom)"
 
           for EXT_MOD in "${EXT_MODULES[@]}"; do
+            # Resolve a literal ".${QCACLD_DEV_NAME}" left unexpanded by the build config
             EXT_MOD=$(echo "$EXT_MOD" | sed "s/\.\${QCACLD_DEV_NAME}/.${QCACLD_DEV_NAME}/")
 
             if [[ ! -d "$ROOT/$EXT_MOD" ]]; then
@@ -432,6 +445,7 @@ jobs:
               continue
             fi
 
+            # --- Source patches (not compile logic) ---
             # securemsm-kernel: drop -Werror / stringify issues, fix hardcoded trace include path
             if [[ "$EXT_MOD" == *"securemsm-kernel"* ]]; then
               echo "Patching securemsm-kernel..."
@@ -439,6 +453,7 @@ jobs:
               find "$ROOT/$EXT_MOD" -type f -name "Kbuild" -exec sed -i 's/-Werror//g' {} + 2>/dev/null || true
               find "$ROOT/$EXT_MOD" -name "trace_smcinvoke.h" -exec sed -i 's/__stringify(\(.*\))/\1/g' {} + 2>/dev/null || true
               find "$ROOT/$EXT_MOD" -name "trace_smcinvoke.h" -exec sed -i '1i #include <linux/stringify.h>' {} + 2>/dev/null || true
+              # Point TRACE_INCLUDE_PATH at the real absolute dir (the hardcoded ../../../../sm8635-modules/... path doesn't exist here)
               find "$ROOT/$EXT_MOD" -name 'trace_*.h' | while read -r th; do
                 d=$(dirname "$(realpath "$th")")
                 sed -i -E "s|^(#define[[:space:]]+TRACE_INCLUDE_PATH[[:space:]]+).*|\1$d|" "$th"
@@ -453,8 +468,13 @@ jobs:
               done
             fi
 
+            # --- Compile + install ---
             set -x
+
+            # The path passed via M must be relative to the kernel source directory
             EXT_MOD_REL=$(realpath -s --relative-to="$KDIR" "$ROOT/$EXT_MOD")
+
+            # The object files will be stored here
             mkdir -p "$OUT/$EXT_MOD_REL"
 
             make -C "$EXT_MOD" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT"
@@ -462,8 +482,10 @@ jobs:
             set +x
           done
 
+          # qcacld builds as <dev>.ko; rename to what the dlkm/vendor_boot lists expect
           find "$MODULES_STAGING_DIR" -name "${QCACLD_DEV_NAME}.ko" -execdir mv -f -- "{}" "qca_cld3_${QCACLD_DEV_NAME}.ko" \;
 
+          # Keep the later steps (vendor_boot + AnyKernel3) working: they read the WLAN module from the qcacld source dir
           WLAN_KO=$(find "$MODULES_STAGING_DIR" -name "qca_cld3_${QCACLD_DEV_NAME}.ko" -print -quit)
           if [[ -n "$WLAN_KO" ]]; then
             cp -f "$WLAN_KO" "$GITHUB_WORKSPACE/vendor/qcom/opensource/wlan/qcacld-3.0/qca_cld3_${QCACLD_DEV_NAME}.ko"
