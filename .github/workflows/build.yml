@@ -382,7 +382,6 @@ jobs:
           KDIR="$(realpath "$ROOT/$KERNEL_DIR")"
           MODULES_STAGING_DIR="$OUT/modules_staging"
 
-          # THE MISSING EXPORTS: Qualcomm modules need these to compile properly
           export BOARD_PLATFORM="$SOC"
           export TARGET_BOARD_PLATFORM="$SOC"
           export MSM_ARCH="$SOC"
@@ -412,22 +411,21 @@ jobs:
             fi
 
             # --- Universal Fix: Hardcoded trace header paths ---
-            find "$ROOT/$EXT_MOD" -name 'trace_*.h' | while read -r th; do
-              if grep -q "define TRACE_INCLUDE_PATH" "$th"; then
+            # Search by file content instead of filename to catch fastrpc_trace.h
+            grep -rl "define TRACE_INCLUDE_PATH" "$ROOT/$EXT_MOD" 2>/dev/null | while read -r th; do
+              if [ -f "$th" ]; then
                 d=$(dirname "$(realpath "$th")")
-                sed -i -E "s|^#[[:space:]]*define[[:space:]]+TRACE_INCLUDE_PATH.*|#define TRACE_INCLUDE_PATH $d|" "$th"
+                sed -i -E "s|^[[:space:]]*#[[:space:]]*define[[:space:]]+TRACE_INCLUDE_PATH.*|#define TRACE_INCLUDE_PATH $d|" "$th"
               fi
             done
             # ------------------------------------------
 
-            # Only remaining patch: Enable Monitor Mode for the WLAN driver
             if [[ "$EXT_MOD" == *"qcacld-3.0"* ]]; then
               for dcfg in "$ROOT/$EXT_MOD/configs/"*"$QCACLD_DEV_NAME"* "$ROOT/$EXT_MOD/configs/default_defconfig"; do
                 [[ -f "$dcfg" ]] && { sed -i '/CONFIG_FEATURE_MONITOR_MODE_SUPPORT/d' "$dcfg"; echo "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y" >> "$dcfg"; }
               done
             fi
 
-            # Export EXTRA_SYMBOLS for this module to resolve cross-module dependencies
             if [[ -n "$EXTRA_SYMBOLS" ]]; then
               export KBUILD_EXTRA_SYMBOLS="$EXTRA_SYMBOLS"
             fi
@@ -440,7 +438,6 @@ jobs:
             make -C "$EXT_MOD" M="$EXT_MOD_REL" "${MAKE_FLAGS[@]}" O="$OUT" INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="$MODULES_STAGING_DIR" INSTALL_MOD_DIR="extra/$EXT_MOD" modules_install
             set +x
 
-            # Collect this module's symbols for the next ones
             if [[ -f "$ROOT/$EXT_MOD/Module.symvers" ]]; then
               EXTRA_SYMBOLS+=" $ROOT/$EXT_MOD/Module.symvers"
             fi
